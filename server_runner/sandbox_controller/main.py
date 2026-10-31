@@ -177,7 +177,7 @@ async def execute_code(
         raise HTTPException(
             status_code=403,
             detail=str(error),
-        ) from error
+        )  from error
 
     except ValueError as error:
 
