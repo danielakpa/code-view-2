@@ -77,9 +77,9 @@ CODEVIEW_RUNNER_TOKEN=47C0yN5pqzydxX7MMRbJ6Yy02NTggZn8FPaTBCyFDCfqaWJ-MiUV87o4if
 
 
 # Internal address of the runner service.
-CODEVIEW_RUNNER_URL=http://127.0.0.1:9000
+CODEVIEW_CONTROLLER_URL=http://127.0.0.1:8002
 
-CODEVIEW_RUNNER_DATABASE_URL=postgresql+psycopg://YOUR_USER:YOUR_PASSWORD@127.0.0.1:5432/YOUR_DATABASE
+CODEVIEW_RUNNER_DATABASE_URL=postgresql+psycopg://codeview_runner:Danielakpa.10@127.0.0.1:5432/codeview_db
 
 sudo docker pull ghcr.io/danielakpa/codeview-developer:dev
 python3 -m pip install fastapi httpx uvicorn               

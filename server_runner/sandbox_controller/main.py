@@ -1,5 +1,8 @@
 """Internal FastAPI application for the CodeView sandbox controller."""
 
+# Print complete error details during debugging.
+import traceback
+
 # ============================================================
 # 1. IMPORTS
 # ============================================================
@@ -185,11 +188,13 @@ async def execute_code(
 
     except SQLAlchemyError as error:
 
+        # Temporarily print the original database error.
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=503,
             detail="Sandbox authorization database unavailable.",
         ) from error
-
     # --------------------------------------------------------
     # STEP 3: EXECUTE THE SOURCE CODE
     # --------------------------------------------------------
@@ -216,6 +221,9 @@ async def execute_code(
         ) from error
 
     except RuntimeError as error:
+
+        # Temporarily print the original Docker execution error.
+        traceback.print_exc()
 
         raise HTTPException(
             status_code=503,
