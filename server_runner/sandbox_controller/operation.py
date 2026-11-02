@@ -7,11 +7,16 @@
 # Create an enumeration of supported sandbox operations.
 from enum import Enum
 
-# Validate unique identifiers.
+# Work with unique identifiers.
 from uuid import UUID
 
 # Validate incoming request data.
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 
 
 # ============================================================
@@ -83,3 +88,26 @@ class SandboxOperationRequest(BaseModel):
     #
     # Using the enum prevents unsupported operations.
     operation: SandboxOperation
+
+    # ========================================================
+    # 4. UUID VALIDATION
+    # ========================================================
+
+    @field_validator("request_id", "sandbox_id")
+    @classmethod
+    def validate_uuid(cls, value: UUID) -> UUID:
+        """
+        Reject empty UUIDs.
+
+        This validator runs when Pydantic creates a
+        SandboxOperationRequest object.
+        """
+
+        # An empty UUID has an integer value of zero.
+        if value.int == 0:
+            raise ValueError(
+                "Sandbox and request UUIDs cannot be empty."
+            )
+
+        # Return the valid UUID.
+        return value

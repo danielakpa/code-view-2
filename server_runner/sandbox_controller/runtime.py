@@ -39,17 +39,20 @@ class DockerRuntime:
         sandbox_id: UUID,
         workspace_path: Path,
     ) -> list[str]:
-        """Build a Docker command to create a sandbox container."""
+        """Build a persistent developer IDE container creation command.
 
-        # Validate the sandbox identifier.
+        The existing workspace mount stays at /workspace for compatibility
+        with the older execution system. Editor data uses separate mounts.
+        """
+
+        # Reject invalid sandbox identifiers.
         if not isinstance(sandbox_id, UUID) or sandbox_id.int == 0:
             raise SandboxRuntimeError("Invalid sandbox ID.")
 
-        # Require a Path object.
+        # Never accept relative paths or missing workspaces.
         if not isinstance(workspace_path, Path):
             raise SandboxRuntimeError("Invalid workspace path.")
 
-        # Require an existing absolute directory.
         if not workspace_path.is_absolute():
             raise SandboxRuntimeError(
                 "Workspace path must be absolute."
@@ -60,19 +63,36 @@ class DockerRuntime:
                 "Workspace directory does not exist."
             )
 
-        # Create a predictable Docker container name.
+        # The workspace manager creates these persistent directories.
+        # Do not silently create them here: the controller should not
+        # change host storage ownership or permissions.
+        persistent_mounts = (
+            ("local", "/home/developer/.local"),
+            ("config", "/home/developer/.config"),
+            ("cache", "/home/developer/.cache"),
+        )
+
+        for directory_name, _ in persistent_mounts:
+            directory_path = workspace_path / directory_name
+
+            if not directory_path.is_dir():
+                raise SandboxRuntimeError(
+                    f"Persistent workspace directory missing: {directory_name}."
+                )
+
+        # Give every sandbox a unique Docker container name.
         container_name = f"codeview-{sandbox_id.hex}"
 
-        # Build the Docker command as a list.
+        # Build the Docker command.
         command = [
             "docker",
             "create",
 
-            # Name the container.
+            # Assign a unique container name.
             "--name",
             container_name,
 
-            # Limit memory.
+            # Limit RAM usage.
             "--memory",
             f"{self.security.memory_limit_mb}m",
 
@@ -84,7 +104,8 @@ class DockerRuntime:
             "--pids-limit",
             str(self.security.process_limit),
 
-            # Disable network access.
+            # Keep network access disabled until we implement a private
+            # IDE network and an authenticated Django reverse proxy.
             "--network",
             "none",
 
@@ -92,40 +113,62 @@ class DockerRuntime:
             "--security-opt",
             "no-new-privileges",
 
-            # Drop Linux capabilities.
+            # Remove unnecessary Linux capabilities.
             "--cap-drop",
             "ALL",
 
-            # Use a read-only container filesystem.
+            # Keep the container's root filesystem read-only.
             "--read-only",
 
-            # Run the container as an unprivileged user.
+            # Run as the non-root developer user.
             "--user",
             "10001:10001",
-            # Provide temporary storage for Go compilation.
-            # Storage is temporary and disappears with the container.
-            "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=256m",
 
-            # Mount the developer's private workspace.
+            # Provide temporary writable storage.
+            "--tmpfs",
+            "/tmp:rw,exec,nosuid,nodev,size=256m",
+
+            # Mount the developer's persistent workspace.
+            #
+            # Existing CodeView components expect /workspace,
+            # so we preserve that location.
             "--mount",
             (
                 "type=bind,"
                 f"source={workspace_path},"
                 "target=/workspace"
             ),
+        ]
 
-            # Set the container's working directory.
+        # Mount persistent application directories.
+        #
+        # These preserve code-server settings, extensions,
+        # and caches when containers are stopped or removed.
+        #
+        # Host directories must be writable by UID 10001
+        # before the container is started.
+        for directory_name, container_path in persistent_mounts:
+            command.extend([
+                "--mount",
+                (
+                    "type=bind,"
+                    f"source={workspace_path / directory_name},"
+                    f"target={container_path}"
+                ),
+            ])
+
+        # Finish building the Docker command.
+        command.extend([
+            # Set the working directory.
             "--workdir",
             "/workspace",
 
-            # Use the approved developer image.
+            # Use the approved CodeView developer image.
             DEVELOPER_IMAGE,
 
-            # Keep the sandbox container running.
-            "sleep",
-            "infinity",
-        ]
+            # Do not override the Dockerfile CMD.
+            # The image now starts code-server automatically.
+        ])
 
         return command
 
@@ -368,7 +411,6 @@ class DockerRuntime:
             "--env",
             "GOCACHE=/opt/codeview/go-cache",
 
-
             # Give Go a writable location for temporary compilation files.
             "--env",
             "GOTMPDIR=/tmp",
@@ -480,8 +522,6 @@ class DockerRuntime:
         container_name: str,
     ) -> list[str]:
         """Build a command to check whether a container still exists."""
-
-        import re
 
         # Only accept names belonging to CodeView Run containers.
         if (
