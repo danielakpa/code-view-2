@@ -1,8 +1,10 @@
 """PostgreSQL integration tests for persistent IDE recovery."""
 
 import os
+import threading
 import unittest
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -31,7 +33,10 @@ class TestRecoveryIntegration(unittest.TestCase):
                 "CODEVIEW_RUNNER_DATABASE_URL is required."
             )
 
-        cls.engine = create_engine(database_url)
+        cls.engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+        )
 
         # Protect the main database from integration tests.
         with cls.engine.connect() as connection:
@@ -68,13 +73,11 @@ class TestRecoveryIntegration(unittest.TestCase):
         self.ide_service = MagicMock()
 
         # Simulate successful Docker inspection.
-        self.ide_service.executor.execute.return_value = (
-            MagicMock(
-                return_code=0,
-                timed_out=False,
-                stdout=f"{self.container_id}|running",
-                stderr="",
-            )
+        self.ide_service.executor.execute.return_value = MagicMock(
+            return_code=0,
+            timed_out=False,
+            stdout=f"{self.container_id}|running",
+            stderr="",
         )
 
     def tearDown(self):
@@ -108,11 +111,18 @@ class TestRecoveryIntegration(unittest.TestCase):
         finally:
             self.db.close()
 
+    # ========================================================
+    # 1. CREATE TEST RECORDS
+    # ========================================================
+
     def create_records(
         self,
         operation,
         sandbox_status,
         container_id=None,
+        lease_owner=None,
+        lease_expires_at=None,
+        lease_generation=0,
     ):
         """Insert a sandbox and an interrupted operation."""
 
@@ -120,7 +130,6 @@ class TestRecoveryIntegration(unittest.TestCase):
             minutes=10
         )
 
-               # Create a sandbox record with its required timestamps.
         self.db.execute(
             text(
                 """
@@ -152,6 +161,7 @@ class TestRecoveryIntegration(unittest.TestCase):
                 "container_id": container_id,
             },
         )
+
         self.db.execute(
             text(
                 """
@@ -162,7 +172,10 @@ class TestRecoveryIntegration(unittest.TestCase):
                     group_id,
                     operation,
                     status,
-                    created_at
+                    created_at,
+                    lease_owner,
+                    lease_expires_at,
+                    lease_generation
                 )
                 VALUES (
                     :request_id,
@@ -171,7 +184,10 @@ class TestRecoveryIntegration(unittest.TestCase):
                     :group_id,
                     :operation,
                     'pending',
-                    :created_at
+                    :created_at,
+                    :lease_owner,
+                    :lease_expires_at,
+                    :lease_generation
                 )
                 """
             ),
@@ -182,10 +198,17 @@ class TestRecoveryIntegration(unittest.TestCase):
                 "group_id": self.group_id,
                 "operation": operation,
                 "created_at": old_time,
+                "lease_owner": lease_owner,
+                "lease_expires_at": lease_expires_at,
+                "lease_generation": lease_generation,
             },
         )
 
         self.db.commit()
+
+    # ========================================================
+    # 2. READ DATABASE RECORDS
+    # ========================================================
 
     def read_records(self):
         """Read saved sandbox and operation states."""
@@ -204,7 +227,12 @@ class TestRecoveryIntegration(unittest.TestCase):
         operation = self.db.execute(
             text(
                 """
-                SELECT status, completed_at
+                SELECT
+                    status,
+                    completed_at,
+                    lease_owner,
+                    lease_generation,
+                    lease_expires_at
                 FROM runner.sandbox_operation_requests
                 WHERE request_id = :request_id
                 """
@@ -213,6 +241,10 @@ class TestRecoveryIntegration(unittest.TestCase):
         ).mappings().one()
 
         return sandbox, operation
+
+    # ========================================================
+    # 3. EXISTING RECOVERY TESTS
+    # ========================================================
 
     def test_start_recovery_updates_postgresql(self):
         """A confirmed running container updates both records."""
@@ -307,13 +339,11 @@ class TestRecoveryIntegration(unittest.TestCase):
             container_id=self.container_id,
         )
 
-        self.ide_service.executor.execute.return_value = (
-            MagicMock(
-                return_code=1,
-                timed_out=False,
-                stdout="",
-                stderr="Docker unavailable",
-            )
+        self.ide_service.executor.execute.return_value = MagicMock(
+            return_code=1,
+            timed_out=False,
+            stdout="",
+            stderr="Docker unavailable",
         )
 
         recovery = SandboxRecoveryService(
@@ -357,7 +387,277 @@ class TestRecoveryIntegration(unittest.TestCase):
 
         self.ide_service.executor.execute.assert_not_called()
 
+    # ========================================================
+    # 4. NEW LEASE TESTS
+    # ========================================================
+
+    def test_active_lease_is_not_recovered(self):
+        """Recovery must skip operations with active leases."""
+
+        active_owner = uuid4()
+
+        active_expiry = datetime.now(timezone.utc) + timedelta(
+            minutes=5
+        )
+
+        self.create_records(
+            operation="start",
+            sandbox_status="starting",
+            container_id=self.container_id,
+            lease_owner=active_owner,
+            lease_expires_at=active_expiry,
+            lease_generation=1,
+        )
+
+        recovery = SandboxRecoveryService(
+            self.db,
+            self.ide_service,
+        )
+
+        result = recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "skipped")
+
+        self.ide_service.executor.execute.assert_not_called()
+
+        _, operation = self.read_records()
+
+        self.assertEqual(
+            operation["lease_owner"],
+            active_owner,
+        )
+
+        self.assertEqual(
+            operation["lease_generation"],
+            1,
+        )
+
+    def test_expired_lease_can_be_recovered(self):
+        """Recovery may claim an expired operation lease."""
+
+        expired_owner = uuid4()
+
+        expired_time = datetime.now(timezone.utc) - timedelta(
+            minutes=5
+        )
+
+        self.create_records(
+            operation="start",
+            sandbox_status="starting",
+            container_id=self.container_id,
+            lease_owner=expired_owner,
+            lease_expires_at=expired_time,
+            lease_generation=1,
+        )
+
+        recovery = SandboxRecoveryService(
+            self.db,
+            self.ide_service,
+        )
+
+        result = recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "completed")
+
+        _, operation = self.read_records()
+
+        self.assertNotEqual(
+            operation["lease_owner"],
+            expired_owner,
+        )
+
+        self.assertEqual(
+            operation["lease_generation"],
+            2,
+        )
+
+    def test_recovery_increases_lease_generation(self):
+        """Recovery must increment the lease generation."""
+
+        expired_owner = uuid4()
+
+        expired_time = datetime.now(timezone.utc) - timedelta(
+            minutes=5
+        )
+
+        self.create_records(
+            operation="start",
+            sandbox_status="starting",
+            container_id=self.container_id,
+            lease_owner=expired_owner,
+            lease_expires_at=expired_time,
+            lease_generation=7,
+        )
+
+        recovery = SandboxRecoveryService(
+            self.db,
+            self.ide_service,
+        )
+
+        result = recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "completed")
+
+        _, operation = self.read_records()
+
+        self.assertEqual(
+            operation["lease_generation"],
+            8,
+        )
+
+    # ========================================================
+    # 5. CONCURRENT RECOVERY CLAIMS
+    # ========================================================
+
+    def test_two_workers_cannot_claim_same_operation(self):
+        """Only one worker may claim an expired IDE operation."""
+
+        expired_owner = uuid4()
+
+        expired_time = datetime.now(timezone.utc) - timedelta(
+            minutes=5
+        )
+
+        self.create_records(
+            operation="start",
+            sandbox_status="starting",
+            container_id=self.container_id,
+            lease_owner=expired_owner,
+            lease_expires_at=expired_time,
+            lease_generation=1,
+        )
+
+        barrier = threading.Barrier(2)
+
+        def claim_from_worker():
+            """Use a separate database session for each worker."""
+
+            with Session(self.engine) as worker_db:
+
+                worker_recovery = SandboxRecoveryService(
+                    worker_db,
+                    MagicMock(),
+                )
+
+                # Make both workers attempt the claim together.
+                barrier.wait(timeout=10)
+
+                return worker_recovery._claim_recovery_lease(
+                    request_id=self.request_id,
+                    older_than_minutes=5,
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+
+            futures = [
+                executor.submit(claim_from_worker)
+                for _ in range(2)
+            ]
+
+            results = [
+                future.result(timeout=15)
+                for future in futures
+            ]
+
+        successful_claims = [
+            result
+            for result in results
+            if result is not None
+        ]
+
+        self.assertEqual(
+            len(successful_claims),
+            1,
+        )
+
+        _, operation = self.read_records()
+
+        self.assertEqual(
+            operation["lease_generation"],
+            2,
+        )
+
+    # ========================================================
+    # 6. STALE WORKER FENCING
+    # ========================================================
+
+    def test_old_worker_cannot_finalize_after_recovery_claim(self):
+        """An old worker must not finalize after losing its lease."""
+
+        old_owner = uuid4()
+
+        expired_time = datetime.now(timezone.utc) - timedelta(
+            minutes=5
+        )
+
+        self.create_records(
+            operation="start",
+            sandbox_status="starting",
+            container_id=self.container_id,
+            lease_owner=old_owner,
+            lease_expires_at=expired_time,
+            lease_generation=1,
+        )
+
+        recovery = SandboxRecoveryService(
+            self.db,
+            self.ide_service,
+        )
+
+        claimed = recovery._claim_recovery_lease(
+            request_id=self.request_id,
+            older_than_minutes=5,
+        )
+
+        self.assertIsNotNone(claimed)
+
+        # Simulate the original worker attempting to save
+        # its result with the previous lease credentials.
+        with Session(self.engine) as stale_db:
+
+            result = stale_db.execute(
+                text(
+                    """
+                    UPDATE runner.sandbox_operation_requests
+                    SET
+                        status = 'completed',
+                        completed_at = NOW()
+                    WHERE request_id = :request_id
+                      AND status = 'pending'
+                      AND lease_owner = :lease_owner
+                      AND lease_generation = :lease_generation
+                      AND lease_expires_at > NOW()
+                    """
+                ),
+                {
+                    "request_id": self.request_id,
+                    "lease_owner": old_owner,
+                    "lease_generation": 1,
+                },
+            )
+
+            self.assertEqual(result.rowcount, 0)
+
+            stale_db.rollback()
+
+        _, operation = self.read_records()
+
+        self.assertEqual(
+            operation["status"],
+            "pending",
+        )
+
+        self.assertEqual(
+            operation["lease_generation"],
+            2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-    

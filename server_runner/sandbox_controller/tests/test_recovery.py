@@ -1,9 +1,8 @@
-"""Tests for recovery of interrupted Docker IDE operations."""
+"""Tests for lease-aware recovery of interrupted Docker IDE operations."""
 
 import unittest
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from server_runner.sandbox_controller.recovery import (
@@ -12,68 +11,78 @@ from server_runner.sandbox_controller.recovery import (
 
 
 class TestSandboxRecoveryService(unittest.TestCase):
-    """Test recovery without executing real Docker commands."""
+    """Test IDE recovery without running real Docker commands."""
 
     def setUp(self):
         """Prepare a mocked database, sandbox, and Docker service."""
 
-        # Create a unique sandbox and operation ID.
         self.sandbox_id = uuid4()
         self.request_id = uuid4()
+        self.lease_owner = uuid4()
+        self.lease_generation = 2
 
-        # Simulate an existing Docker container.
         self.container_id = "a" * 64
 
-        # Mock the PostgreSQL session.
+        # Mock PostgreSQL.
         self.db = MagicMock()
 
-        # Mock the Docker IDE service.
+        # Mock Docker.
         self.ide_service = MagicMock()
 
-        # Initialize the existing recovery service.
+        # Create the recovery service.
         self.recovery = SandboxRecoveryService(
             db=self.db,
             ide_service=self.ide_service,
         )
 
-        # Simulate the sandbox record.
+        # Simulate an existing sandbox.
         self.sandbox = MagicMock()
         self.sandbox.sandbox_id = self.sandbox_id
         self.sandbox.container_id = self.container_id
         self.sandbox.status = "starting"
 
-        # The first query returns the pending operation.
+        # Simulate a successfully claimed recovery lease.
         self.operation = {
             "request_id": self.request_id,
             "sandbox_id": self.sandbox_id,
             "operation": "start",
-            "status": "pending",
+            "lease_owner": self.lease_owner,
+            "lease_generation": self.lease_generation,
         }
 
-        # Configure the two database queries:
-        # 1. Find the pending operation.
-        # 2. Find the sandbox record.
+        # Simulate Docker reporting a running container.
+        self.ide_service.executor.execute.return_value = MagicMock(
+            return_code=0,
+            timed_out=False,
+            stdout=f"{self.container_id}|running",
+            stderr="",
+        )
+
+        # Mock the recovery claim by default.
+        self.claim_patcher = patch.object(
+            self.recovery,
+            "_claim_recovery_lease",
+            return_value=self.operation,
+        )
+
+        self.mock_claim = self.claim_patcher.start()
+
+        self.addCleanup(self.claim_patcher.stop)
+
+        # Configure database responses for the final transaction:
+        #
+        # 1. Lock sandbox.
+        # 2. Verify recovery ownership.
+        # 3. Update operation status.
         self.db.execute.side_effect = [
-            MagicMock(
-                mappings=lambda: MagicMock(
-                    one_or_none=lambda: self.operation
-                )
-            ),
             MagicMock(
                 scalar_one_or_none=lambda: self.sandbox
             ),
-            MagicMock(),  # UPDATE operation status.
-        ]
-
-        # Simulate Docker returning a running container.
-        self.ide_service.executor.execute.return_value = (
             MagicMock(
-                return_code=0,
-                timed_out=False,
-                stdout=f"{self.container_id}|running",
-                stderr="",
-            )
-        )
+                one_or_none=lambda: (self.request_id,)
+            ),
+            MagicMock(rowcount=1),
+        ]
 
     def test_start_recovery(self):
         """Recover an IDE that Docker successfully started."""
@@ -108,7 +117,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.db.commit.assert_called_once()
 
     def test_create_recovery_saves_container_id(self):
-        """Recover a container ID missing from PostgreSQL."""
+        """Recover a Docker container ID missing from PostgreSQL."""
 
         self.operation["operation"] = "create"
         self.sandbox.container_id = None
@@ -123,6 +132,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "completed")
+
         self.assertEqual(
             self.sandbox.container_id,
             self.container_id,
@@ -131,7 +141,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.db.commit.assert_called_once()
 
     def test_inspect_recovery_does_not_change_lifecycle(self):
-        """Inspection must not change the sandbox lifecycle."""
+        """INSPECT must not change the sandbox lifecycle."""
 
         self.operation["operation"] = "inspect"
         self.sandbox.status = "running"
@@ -146,15 +156,13 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.db.commit.assert_called_once()
 
     def test_docker_failure_keeps_operation_pending(self):
-        """Do not claim recovery succeeded if Docker is unavailable."""
+        """Docker failures must not produce false recovery success."""
 
-        self.ide_service.executor.execute.return_value = (
-            MagicMock(
-                return_code=1,
-                timed_out=False,
-                stdout="",
-                stderr="Docker unavailable",
-            )
+        self.ide_service.executor.execute.return_value = MagicMock(
+            return_code=1,
+            timed_out=False,
+            stdout="",
+            stderr="Docker unavailable",
         )
 
         result = self.recovery.recover_operation(
@@ -164,11 +172,12 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.assertEqual(result.status, "unresolved")
         self.assertEqual(self.sandbox.status, "starting")
 
+        # The recovery lease was claimed, but the operation
+        # must not be finalized.
         self.db.commit.assert_not_called()
-        self.db.rollback.assert_called_once()
 
     def test_container_identity_mismatch(self):
-        """Reject a container that differs from the saved ID."""
+        """Reject Docker containers with unexpected IDs."""
 
         different_id = "b" * 64
 
@@ -186,15 +195,9 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.db.commit.assert_not_called()
 
     def test_operation_not_eligible(self):
-        """Skip operations that are not pending or are locked."""
+        """Skip operations that cannot claim recovery ownership."""
 
-        self.db.execute.side_effect = [
-            MagicMock(
-                mappings=lambda: MagicMock(
-                    one_or_none=lambda: None
-                )
-            )
-        ]
+        self.mock_claim.return_value = None
 
         result = self.recovery.recover_operation(
             self.request_id
@@ -202,24 +205,24 @@ class TestSandboxRecoveryService(unittest.TestCase):
 
         self.assertEqual(result.status, "skipped")
 
-        # Docker must not be contacted.
         self.ide_service.executor.execute.assert_not_called()
 
     def test_invalid_request_id(self):
-        """Reject invalid recovery request identifiers."""
+        """Reject invalid request IDs."""
 
         with self.assertRaises(ValueError):
             self.recovery.recover_operation(
                 "not-a-uuid"
             )
 
-        self.db.execute.assert_not_called()
+        self.mock_claim.assert_not_called()
 
     def test_invalid_recovery_age(self):
         """Reject invalid recovery cutoff values."""
 
         for invalid_age in (0, -1, True, "five"):
             with self.subTest(age=invalid_age):
+
                 with self.assertRaises(ValueError):
                     self.recovery.recover_operation(
                         self.request_id,
@@ -227,7 +230,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
                     )
 
     def test_unconfirmed_start_does_not_report_success(self):
-        """A stopped Docker container does not prove startup succeeded."""
+        """A stopped container does not prove startup succeeded."""
 
         self.ide_service.executor.execute.return_value.stdout = (
             f"{self.container_id}|exited"
@@ -243,17 +246,12 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.db.commit.assert_not_called()
 
     def test_missing_sandbox_is_unresolved(self):
-        """Do not recover an operation without its sandbox record."""
+        """Do not finalize recovery without a sandbox record."""
 
         self.db.execute.side_effect = [
             MagicMock(
-                mappings=lambda: MagicMock(
-                    one_or_none=lambda: self.operation
-                )
-            ),
-            MagicMock(
                 scalar_one_or_none=lambda: None
-            ),
+            )
         ]
 
         result = self.recovery.recover_operation(
@@ -262,13 +260,10 @@ class TestSandboxRecoveryService(unittest.TestCase):
 
         self.assertEqual(result.status, "unresolved")
 
-        # Docker must not run without a trusted sandbox.
-        self.ide_service.executor.execute.assert_not_called()
-
         self.db.commit.assert_not_called()
 
     def test_recovery_uses_trusted_container_name(self):
-        """Docker inspection must use CodeView's sandbox name."""
+        """Docker inspection must use the trusted sandbox UUID."""
 
         self.recovery.recover_operation(
             self.request_id
@@ -283,7 +278,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.assertEqual(command[-1], expected_name)
 
     def test_find_pending_operations_rejects_invalid_age(self):
-        """Validate recovery age before querying PostgreSQL."""
+        """Reject invalid recovery age values."""
 
         with self.assertRaises(ValueError):
             self.recovery.find_pending_operations(
@@ -291,6 +286,48 @@ class TestSandboxRecoveryService(unittest.TestCase):
             )
 
         self.db.execute.assert_not_called()
+
+    def test_lost_recovery_lease_cannot_finalize(self):
+        """A recovery worker that loses ownership must not save."""
+
+        # First query finds the sandbox.
+        # Second query finds no matching lease owner.
+        self.db.execute.side_effect = [
+            MagicMock(
+                scalar_one_or_none=lambda: self.sandbox
+            ),
+            MagicMock(
+                one_or_none=lambda: None
+            ),
+        ]
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "skipped")
+
+        self.db.commit.assert_not_called()
+
+    def test_failed_fenced_update_rolls_back(self):
+        """Reject finalization if the recovery lease expires."""
+
+        self.db.execute.side_effect = [
+            MagicMock(
+                scalar_one_or_none=lambda: self.sandbox
+            ),
+            MagicMock(
+                one_or_none=lambda: (self.request_id,)
+            ),
+            MagicMock(rowcount=0),
+        ]
+
+        with self.assertRaises(RuntimeError):
+            self.recovery.recover_operation(
+                self.request_id
+            )
+
+        self.db.rollback.assert_called()
 
 
 if __name__ == "__main__":

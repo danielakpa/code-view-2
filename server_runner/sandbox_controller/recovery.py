@@ -1,8 +1,8 @@
-"""Recover interrupted persistent Docker IDE operations."""
+"""Recover interrupted persistent Docker IDE operations safely."""
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -35,9 +35,8 @@ class RecoveryResult:
 # ============================================================
 
 class SandboxRecoveryService:
-    """Reconcile unfinished IDE operations with Docker."""
+    """Reconcile interrupted IDE operations with Docker."""
 
-    # Only persistent IDE operations are recoverable here.
     IDE_OPERATIONS = {
         "create",
         "start",
@@ -45,12 +44,15 @@ class SandboxRecoveryService:
         "inspect",
     }
 
+    # Give recovery a temporary lease while inspecting Docker.
+    RECOVERY_LEASE_SECONDS = 120
+
     def __init__(
         self,
         db: Session,
         ide_service: DeveloperIDEService | None = None,
     ):
-        """Reuse the existing database and Docker services."""
+        """Initialize database and Docker services."""
 
         self.db = db
 
@@ -61,14 +63,14 @@ class SandboxRecoveryService:
         )
 
     # ========================================================
-    # 3. FIND UNFINISHED OPERATIONS
+    # 3. FIND ELIGIBLE OPERATIONS
     # ========================================================
 
     def find_pending_operations(
         self,
         older_than_minutes: int = 5,
     ):
-        """Find old pending IDE operations, excluding RUN."""
+        """Find old IDE operations whose leases have expired."""
 
         if (
             isinstance(older_than_minutes, bool)
@@ -99,19 +101,28 @@ class SandboxRecoveryService:
                   'inspect'
               )
               AND created_at < :cutoff
+
+              -- Never recover an operation with an active lease.
+              AND (
+                  lease_expires_at IS NULL
+                  OR lease_expires_at <= NOW()
+              )
+
             ORDER BY created_at, request_id
             """
         )
 
-        rows = self.db.execute(
-            statement,
-            {"cutoff": cutoff},
-        ).mappings().all()
+        try:
+            rows = self.db.execute(
+                statement,
+                {"cutoff": cutoff},
+            ).mappings().all()
 
-        # Finish the read transaction before recovery begins.
-        self.db.rollback()
+            return list(rows)
 
-        return list(rows)
+        finally:
+            # Close the read transaction.
+            self.db.rollback()
 
     # ========================================================
     # 4. INSPECT DOCKER BY CONTAINER NAME
@@ -119,16 +130,14 @@ class SandboxRecoveryService:
 
     def _inspect_container(self, sandbox_id: UUID):
         """
-        Find a container using CodeView's deterministic name.
+        Find an IDE container using its deterministic Docker name.
 
-        This handles CREATE operations where PostgreSQL has
-        not yet received the Docker container ID.
+        This also handles CREATE operations where PostgreSQL
+        does not yet contain the container ID.
         """
 
-        # Match the naming convention in DockerRuntime.
         container_name = f"codeview-{sandbox_id.hex}"
 
-        # The name comes from a validated UUID, not user text.
         command = [
             "docker",
             "inspect",
@@ -137,15 +146,12 @@ class SandboxRecoveryService:
             container_name,
         ]
 
-        # Reuse the existing trusted command executor.
         result = self.ide_service.executor.execute(command)
 
         if result.timed_out:
             return None, None, "Docker inspection timed out."
 
         if result.return_code != 0:
-            # A failed inspect is not proof that a container
-            # never existed. Docker itself might be unavailable.
             return (
                 None,
                 None,
@@ -158,11 +164,14 @@ class SandboxRecoveryService:
         parts = output.split("|", 1)
 
         if len(parts) != 2:
-            return None, None, "Unexpected Docker inspection output."
+            return (
+                None,
+                None,
+                "Unexpected Docker inspection output.",
+            )
 
         container_id, docker_status = parts
 
-        # Validate Docker's returned container ID.
         if (
             len(container_id) != 64
             or any(
@@ -170,82 +179,44 @@ class SandboxRecoveryService:
                 for character in container_id.lower()
             )
         ):
-            return None, None, "Invalid Docker container ID."
+            return (
+                None,
+                None,
+                "Invalid Docker container ID.",
+            )
 
         return container_id, docker_status, None
 
     # ========================================================
-    # 5. UPDATE AN OPERATION
+    # 5. CLAIM RECOVERY OWNERSHIP
     # ========================================================
 
-    def _finish_operation(
+    def _claim_recovery_lease(
         self,
         request_id: UUID,
-        status: str,
-        error_message: str | None = None,
+        older_than_minutes: int,
     ):
-        """Save a completed or failed operation."""
+        """
+        Atomically claim an expired IDE operation for recovery.
 
-        if status not in {"completed", "failed"}:
-            raise ValueError("Invalid recovery result status.")
-
-        self.db.execute(
-            text(
-                """
-                UPDATE runner.sandbox_operation_requests
-                SET
-                    status = :status,
-                    completed_at = NOW(),
-                    error_message = :error_message
-                WHERE request_id = :request_id
-                  AND status = 'pending'
-                """
-            ),
-            {
-                "request_id": request_id,
-                "status": status,
-                "error_message": error_message,
-            },
-        )
-
-    # ========================================================
-    # 6. RECOVER ONE OPERATION
-    # ========================================================
-
-    def recover_operation(
-        self,
-        request_id: UUID,
-        older_than_minutes: int = 5,
-    ) -> RecoveryResult:
-        """Inspect Docker and reconcile one interrupted operation."""
-
-        if not isinstance(request_id, UUID):
-            raise ValueError("Invalid recovery request ID.")
-
-        if (
-            isinstance(older_than_minutes, bool)
-            or not isinstance(older_than_minutes, int)
-            or older_than_minutes < 1
-        ):
-            raise ValueError("Invalid recovery age.")
+        Recovery receives a new owner and generation.
+        The original worker can no longer finalize its operation
+        using its previous lease credentials.
+        """
 
         cutoff = datetime.now(timezone.utc) - timedelta(
             minutes=older_than_minutes
         )
 
-        try:
-            # ------------------------------------------------
-            # STEP 1: LOCK THE OPERATION RECORD
-            # ------------------------------------------------
+        recovery_owner = uuid4()
 
+        try:
+            # First identify the sandbox without taking a lock.
             operation = self.db.execute(
                 text(
                     """
                     SELECT
-                        request_id,
-                        sandbox_id,
-                        operation,
-                        status
+                        sandbox_id
                     FROM runner.sandbox_operation_requests
                     WHERE request_id = :request_id
                       AND status = 'pending'
@@ -256,7 +227,10 @@ class SandboxRecoveryService:
                           'inspect'
                       )
                       AND created_at < :cutoff
-                    FOR UPDATE SKIP LOCKED
+                      AND (
+                          lease_expires_at IS NULL
+                          OR lease_expires_at <= NOW()
+                      )
                     """
                 ),
                 {
@@ -267,26 +241,215 @@ class SandboxRecoveryService:
 
             if operation is None:
                 self.db.rollback()
-
-                return RecoveryResult(
-                    request_id=str(request_id),
-                    sandbox_id="",
-                    operation="unknown",
-                    status="skipped",
-                    docker_status=None,
-                    message=(
-                        "Operation is not eligible for recovery "
-                        "or is locked by another recovery worker."
-                    ),
-                )
+                return None
 
             sandbox_id = operation["sandbox_id"]
-            operation_name = operation["operation"]
 
-            # ------------------------------------------------
-            # STEP 2: LOCK THE SANDBOX
-            # ------------------------------------------------
+            # Lock sandbox first, matching the IDE handler.
+            sandbox = self.db.execute(
+                select(SandboxRecord)
+                .where(
+                    SandboxRecord.sandbox_id == sandbox_id
+                )
+                .with_for_update(skip_locked=True)
+            ).scalar_one_or_none()
 
+            if sandbox is None:
+                self.db.rollback()
+                return None
+
+            # Claim the operation only if its lease is still expired.
+            #
+            # The generation increases so the original worker's
+            # ownership credentials become invalid.
+            claimed = self.db.execute(
+                text(
+                    """
+                    UPDATE runner.sandbox_operation_requests
+                    SET
+                        lease_owner = :recovery_owner,
+                        lease_generation = lease_generation + 1,
+                        lease_expires_at = (
+                            NOW()
+                            + (:lease_seconds * INTERVAL '1 second')
+                        )
+                    WHERE request_id = :request_id
+                      AND sandbox_id = :sandbox_id
+                      AND status = 'pending'
+                      AND operation IN (
+                          'create',
+                          'start',
+                          'stop',
+                          'inspect'
+                      )
+                      AND created_at < :cutoff
+                      AND (
+                          lease_expires_at IS NULL
+                          OR lease_expires_at <= NOW()
+                      )
+                    RETURNING
+                        request_id,
+                        sandbox_id,
+                        operation,
+                        lease_owner,
+                        lease_generation
+                    """
+                ),
+                {
+                    "request_id": request_id,
+                    "sandbox_id": sandbox_id,
+                    "cutoff": cutoff,
+                    "recovery_owner": recovery_owner,
+                    "lease_seconds": self.RECOVERY_LEASE_SECONDS,
+                },
+            ).mappings().one_or_none()
+
+            if claimed is None:
+                self.db.rollback()
+                return None
+
+            # Save the recovery lease before inspecting Docker.
+            self.db.commit()
+
+            return dict(claimed)
+
+        except Exception:
+            self.db.rollback()
+            raise
+
+    # ========================================================
+    # 6. FINISH AN OPERATION USING RECOVERY OWNERSHIP
+    # ========================================================
+
+    def _finish_operation(
+        self,
+        request_id: UUID,
+        status: str,
+        lease_owner: UUID,
+        lease_generation: int,
+        error_message: str | None = None,
+    ):
+        """Finalize an operation only while recovery owns its lease."""
+
+        if status not in {"completed", "failed"}:
+            raise ValueError(
+                "Invalid recovery result status."
+            )
+
+        result = self.db.execute(
+            text(
+                """
+                UPDATE runner.sandbox_operation_requests
+                SET
+                    status = :status,
+                    completed_at = NOW(),
+                    error_message = :error_message
+                WHERE request_id = :request_id
+                  AND status = 'pending'
+                  AND lease_owner = :lease_owner
+                  AND lease_generation = :lease_generation
+                  AND lease_expires_at > NOW()
+                """
+            ),
+            {
+                "request_id": request_id,
+                "status": status,
+                "lease_owner": lease_owner,
+                "lease_generation": lease_generation,
+                "error_message": error_message,
+            },
+        )
+
+        if result.rowcount != 1:
+            raise RuntimeError(
+                "Recovery cannot finalize the operation: "
+                "lease expired or ownership was lost."
+            )
+
+    # ========================================================
+    # 7. RECOVER ONE OPERATION
+    # ========================================================
+
+    def recover_operation(
+        self,
+        request_id: UUID,
+        older_than_minutes: int = 5,
+    ) -> RecoveryResult:
+        """Inspect Docker and reconcile one interrupted operation."""
+
+        if not isinstance(request_id, UUID):
+            raise ValueError(
+                "Invalid recovery request ID."
+            )
+
+        if (
+            isinstance(older_than_minutes, bool)
+            or not isinstance(older_than_minutes, int)
+            or older_than_minutes < 1
+        ):
+            raise ValueError(
+                "Invalid recovery age."
+            )
+
+        # ----------------------------------------------------
+        # STEP 1: CLAIM THE EXPIRED OPERATION
+        # ----------------------------------------------------
+
+        claimed = self._claim_recovery_lease(
+            request_id=request_id,
+            older_than_minutes=older_than_minutes,
+        )
+
+        if claimed is None:
+            return RecoveryResult(
+                request_id=str(request_id),
+                sandbox_id="",
+                operation="unknown",
+                status="skipped",
+                docker_status=None,
+                message=(
+                    "Operation is not eligible for recovery, "
+                    "has an active lease, or is locked."
+                ),
+            )
+
+        sandbox_id = claimed["sandbox_id"]
+        operation_name = claimed["operation"]
+        lease_owner = claimed["lease_owner"]
+        lease_generation = claimed["lease_generation"]
+
+        # ----------------------------------------------------
+        # STEP 2: INSPECT DOCKER OUTSIDE DATABASE LOCKS
+        # ----------------------------------------------------
+
+        try:
+            container_id, docker_status, error = (
+                self._inspect_container(sandbox_id)
+            )
+
+        except Exception as inspection_error:
+            container_id = None
+            docker_status = None
+            error = str(inspection_error)
+
+        if error:
+            # Do not guess Docker's state after an inspection error.
+            # Leave the operation pending for later recovery.
+            return RecoveryResult(
+                request_id=str(request_id),
+                sandbox_id=str(sandbox_id),
+                operation=operation_name,
+                status="unresolved",
+                docker_status=None,
+                message=error,
+            )
+
+        # ----------------------------------------------------
+        # STEP 3: RECHECK OWNERSHIP AND LOCK THE SANDBOX
+        # ----------------------------------------------------
+
+        try:
+            # Keep lock order consistent with the IDE handler.
             sandbox = self.db.execute(
                 select(SandboxRecord)
                 .where(
@@ -296,8 +459,6 @@ class SandboxRecoveryService:
             ).scalar_one_or_none()
 
             if sandbox is None:
-                # Missing sandbox records require investigation.
-                # Do not guess the correct lifecycle.
                 self.db.rollback()
 
                 return RecoveryResult(
@@ -305,34 +466,48 @@ class SandboxRecoveryService:
                     sandbox_id=str(sandbox_id),
                     operation=operation_name,
                     status="unresolved",
-                    docker_status=None,
+                    docker_status=docker_status,
                     message="Sandbox database record is missing.",
                 )
 
-            # ------------------------------------------------
-            # STEP 3: INSPECT THE ACTUAL DOCKER CONTAINER
-            # ------------------------------------------------
+            # Verify recovery still owns the operation.
+            ownership = self.db.execute(
+                text(
+                    """
+                    SELECT request_id
+                    FROM runner.sandbox_operation_requests
+                    WHERE request_id = :request_id
+                      AND sandbox_id = :sandbox_id
+                      AND status = 'pending'
+                      AND lease_owner = :lease_owner
+                      AND lease_generation = :lease_generation
+                      AND lease_expires_at > NOW()
+                    FOR UPDATE
+                    """
+                ),
+                {
+                    "request_id": request_id,
+                    "sandbox_id": sandbox_id,
+                    "lease_owner": lease_owner,
+                    "lease_generation": lease_generation,
+                },
+            ).one_or_none()
 
-            container_id, docker_status, error = (
-                self._inspect_container(sandbox_id)
-            )
-
-            if error:
-                # Leave the operation pending if Docker's
-                # actual state cannot be established.
+            if ownership is None:
                 self.db.rollback()
 
                 return RecoveryResult(
                     request_id=str(request_id),
                     sandbox_id=str(sandbox_id),
                     operation=operation_name,
-                    status="unresolved",
-                    docker_status=None,
-                    message=error,
+                    status="skipped",
+                    docker_status=docker_status,
+                    message=(
+                        "Recovery lease expired or ownership was lost."
+                    ),
                 )
 
-            # A saved container ID must match the container
-            # found using CodeView's deterministic name.
+            # Confirm the container identity.
             if (
                 sandbox.container_id
                 and sandbox.container_id != container_id
@@ -362,8 +537,6 @@ class SandboxRecoveryService:
                     "running",
                     "exited",
                 }:
-                    # Recover the ID even if the original
-                    # CREATE request crashed before saving it.
                     sandbox.container_id = container_id
 
                     if docker_status == "running":
@@ -375,7 +548,6 @@ class SandboxRecoveryService:
             elif operation_name == "start":
 
                 if docker_status == "running":
-                    # Docker confirms that startup succeeded.
                     sandbox.status = "running"
 
                     completed = True
@@ -384,7 +556,6 @@ class SandboxRecoveryService:
             elif operation_name == "stop":
 
                 if docker_status == "exited":
-                    # Docker confirms that shutdown succeeded.
                     sandbox.status = "stopped"
 
                     completed = True
@@ -392,8 +563,7 @@ class SandboxRecoveryService:
 
             elif operation_name == "inspect":
 
-                # Inspection is read-only.
-                # It does not change the sandbox lifecycle.
+                # Inspection does not change the sandbox lifecycle.
                 completed = True
                 message = "IDE inspection recovered."
 
@@ -405,8 +575,11 @@ class SandboxRecoveryService:
                 self._finish_operation(
                     request_id=request_id,
                     status="completed",
+                    lease_owner=lease_owner,
+                    lease_generation=lease_generation,
                 )
 
+                # Commit sandbox and operation changes together.
                 self.db.commit()
 
                 return RecoveryResult(
@@ -418,8 +591,8 @@ class SandboxRecoveryService:
                     message=message,
                 )
 
-            # Docker's state does not prove that the requested
-            # operation completed. Leave it pending.
+            # Docker does not confirm the requested operation.
+            # Leave it pending for further investigation.
             self.db.rollback()
 
             return RecoveryResult(
@@ -439,14 +612,14 @@ class SandboxRecoveryService:
             raise
 
     # ========================================================
-    # 7. RECOVER ALL ELIGIBLE OPERATIONS
+    # 8. RECOVER ALL ELIGIBLE OPERATIONS
     # ========================================================
 
     def recover_pending_operations(
         self,
         older_than_minutes: int = 5,
     ) -> list[RecoveryResult]:
-        """Attempt recovery for all eligible IDE operations."""
+        """Attempt recovery for every eligible IDE operation."""
 
         pending_operations = self.find_pending_operations(
             older_than_minutes=older_than_minutes
@@ -464,8 +637,7 @@ class SandboxRecoveryService:
                 )
 
             except Exception as error:
-                # One failed recovery must not prevent the
-                # remaining operations from being inspected.
+                # Continue processing other operations.
                 result = RecoveryResult(
                     request_id=str(request_id),
                     sandbox_id=str(operation["sandbox_id"]),

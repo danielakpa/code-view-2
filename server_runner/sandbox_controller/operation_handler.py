@@ -7,6 +7,11 @@
 # Update operation-tracking records in PostgreSQL.
 from sqlalchemy import text
 
+# Keep PostgreSQL leases active while Docker operations execute.
+from server_runner.sandbox_controller.lease_heartbeat import (
+    IDELeaseHeartbeat,
+)
+
 # Reuse the existing Docker IDE service.
 from server_runner.sandbox_controller.developer_ide import (
     DeveloperIDEService,
@@ -522,6 +527,19 @@ class SandboxOperationHandler:
         # ----------------------------------------------------
         # STEP 3: EXECUTE DOCKER
         # ----------------------------------------------------
+        # ----------------------------------------------------
+        # STEP 3: EXECUTE DOCKER
+        # ----------------------------------------------------
+
+        # Create a heartbeat for this IDE operation.
+        heartbeat = IDELeaseHeartbeat(
+            request_id=request.request_id,
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+        # Start renewing the PostgreSQL lease.
+        heartbeat.start()
 
         ide_service = DeveloperIDEService()
 
@@ -529,7 +547,6 @@ class SandboxOperationHandler:
         docker_status = None
         error_message = None
         success = False
-
         try:
             if request.operation == SandboxOperation.CREATE:
 
@@ -653,11 +670,31 @@ class SandboxOperationHandler:
             error_message = str(error)
             success = False
 
+        finally:
+            # Stop the heartbeat even if Docker fails.
+            heartbeat.stop()
+
+        # Reject results if lease ownership was lost.
+        if heartbeat.lost_lease:
+            raise RuntimeError(
+                "IDE operation lease was lost during Docker execution."
+            )
+
+        # ----------------------------------------------------
+        # STEP 4: SAVE THE CONFIRMED RESULT
+        # ----------------------------------------------------
         # ----------------------------------------------------
         # STEP 4: SAVE THE CONFIRMED RESULT
         # ----------------------------------------------------
 
         try:
+            # Verify that this worker still owns the IDE lease.
+            self._verify_ide_lease(
+                request_id=request.request_id,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+            )
+
             # Lock the sandbox again before updating its state.
             statement = (
                 select(SandboxRecord)
@@ -714,7 +751,7 @@ class SandboxOperationHandler:
             # Save the sandbox changes and operation result
             # together in one PostgreSQL transaction.
             self.db.commit()
-            
+
         except Exception:
             self.db.rollback()
             raise
