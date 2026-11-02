@@ -1,11 +1,18 @@
 # ==========================================
-# CODEVIEW DEVELOPER ENVIRONMENT
+# CODEVIEW 2.0 - CLOUD DEVELOPMENT ENVIRONMENT
 # ==========================================
 
-# Start with an official Go image based on Debian.
+# Use Debian with Go already installed.
 FROM golang:1.24-bookworm
 
-# Install Python, Node.js, npm, Git, and Linux tools.
+# Prevent interactive installation prompts.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ==========================================
+# INSTALL PROGRAMMING LANGUAGES AND TOOLS
+# ==========================================
+
+# Install commonly used development tools.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 \
@@ -14,53 +21,88 @@ RUN apt-get update && \
         nodejs \
         npm \
         git \
-        bash \
         curl \
         ca-certificates \
-        coreutils \
-        procps \
+        bash \
         nano \
+        procps \
+        tini \
+        build-essential \
+        default-jdk \
+        php-cli \
+        ruby \
         && rm -rf /var/lib/apt/lists/*
 
-# Create a regular Linux user for the developer.
+# ==========================================
+# INSTALL CODE-SERVER
+# ==========================================
+
+# Install code-server.
+# For production, pin and verify a specific release.
+RUN curl -fsSL https://code-server.dev/install.sh \
+        -o /tmp/install-code-server.sh && \
+    sh /tmp/install-code-server.sh \
+        --method=standalone \
+        --prefix=/usr/local && \
+    rm /tmp/install-code-server.sh
+
+# ==========================================
+# CREATE DEVELOPER USER
+# ==========================================
+
+# Developers must not run as root.
 RUN useradd \
     --create-home \
     --shell /bin/bash \
     --uid 10001 \
     developer
 
-# Create the developer's workspace directory.
-RUN mkdir -p /workspace && \
-    chown developer:developer /workspace
-
 # ==========================================
-# PREPARE GO BUILD CACHE
+# PREPARE WORKSPACE
 # ==========================================
 
-# Store precompiled Go dependencies in the image.
-# This location remains readable when the container
-# runs with a read-only filesystem.
-ENV GOCACHE=/opt/codeview/go-cache
+# Create persistent mount locations.
+RUN mkdir -p /workspace /home/developer/.local \
+    /home/developer/.config \
+    /home/developer/.cache && \
+    chown -R developer:developer \
+        /workspace \
+        /home/developer
 
-# Create the cache directory.
-RUN mkdir -p /opt/codeview/go-cache && \
-    chown -R developer:developer /opt/codeview/go-cache
+# ==========================================
+# ENVIRONMENT VARIABLES
+# ==========================================
 
-# Switch to the unprivileged developer.
-USER developer
+ENV HOME=/home/developer
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# Compile a small Go program during image creation.
-# This warms Go's build cache, including packages
-# commonly required by simple Go programs.
-RUN mkdir -p /tmp/codeview-go-warmup && \
-    printf 'package main\nimport "fmt"\nfunc main() { fmt.Println("ready") }\n' \
-        > /tmp/codeview-go-warmup/main.go && \
-    cd /tmp/codeview-go-warmup && \
-    go build -o /tmp/codeview-go-warmup/app main.go && \
-    rm -rf /tmp/codeview-go-warmup
-
-# Set the default working directory.
+# Default directory opened by the IDE.
 WORKDIR /workspace
 
-# Start Bash when the container launches.
-CMD ["/bin/bash"]
+# ==========================================
+# SECURITY
+# ==========================================
+
+# Run code-server as a non-root user.
+USER developer
+
+# Internal IDE port.
+# EXPOSE does not publish the port publicly.
+EXPOSE 8080
+
+# Manage child processes and shutdown signals.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# ==========================================
+# START CODE-SERVER
+# ==========================================
+
+# Start the IDE.
+# A password must be supplied through environment
+# configuration when the container is launched.
+CMD ["code-server", \
+     "--bind-addr", "0.0.0.0:8080", \
+     "--auth", "password", \
+     "--disable-telemetry", \
+     "/workspace"]
