@@ -184,6 +184,237 @@ class TestSandboxOperationHandler(unittest.TestCase):
 
         # Undo the transaction.
         self.db.rollback.assert_called_once()
+
+    # ========================================================
+    # IDE OPERATIONS — CODEVIEW 2.0
+    # ========================================================
+
+    def test_ide_create_saves_container_id(self):
+        """Creating an IDE must save its Docker container ID."""
+
+        from unittest.mock import patch
+        from server_runner.sandbox_controller.developer_ide import (
+            DeveloperIDEResult,
+        )
+
+        # Simulate a sandbox without a Docker container.
+        self.sandbox.container_id = None
+
+        # Simulate Docker returning a valid container ID.
+        container_id = "a" * 64
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            mock_service.return_value.create_ide.return_value = (
+                DeveloperIDEResult(
+                    success=True,
+                    output=container_id,
+                    error="",
+                )
+            )
+            # Simulate Docker confirming that the container exists.
+            mock_service.return_value.inspect_ide.return_value = (
+                DeveloperIDEResult(
+                    success=True,
+                    output="created",
+                    error="",
+                )
+            )
+
+            # Execute the IDE creation operation.
+            result = self.handler.handle_ide_operation(
+                self.make_request(SandboxOperation.CREATE)
+            )
+
+        # The database must contain the created container ID.
+        self.assertEqual(
+            self.sandbox.container_id,
+            container_id,
+        )
+
+        self.assertEqual(result["status"], "completed")
+
+    def test_ide_start_uses_saved_container_id(self):
+        """Start the container assigned to the developer."""
+
+        from unittest.mock import patch
+        from server_runner.sandbox_controller.developer_ide import (
+            DeveloperIDEResult,
+        )
+
+        container_id = "b" * 64
+
+        # The container has already been created.
+        self.sandbox.container_id = container_id
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            # Simulate successful Docker startup.
+            mock_service.return_value.start_ide.return_value = (
+                DeveloperIDEResult(True, container_id, "")
+            )
+
+            # Docker confirms the container is running.
+            mock_service.return_value.inspect_ide.return_value = (
+                DeveloperIDEResult(True, "running", "")
+            )
+
+            result = self.handler.handle_ide_operation(
+                self.make_request(SandboxOperation.START)
+            )
+
+            # Verify that Docker received the stored ID.
+            mock_service.return_value.start_ide.assert_called_once_with(
+                container_id
+            )
+
+        self.assertEqual(
+            self.sandbox.status,
+            "running",
+        )
+
+        self.assertEqual(result["status"], "completed")
+
+    def test_ide_stop_confirms_docker_stopped(self):
+        """Stop an IDE only after confirming Docker's state."""
+
+        from unittest.mock import patch
+        from server_runner.sandbox_controller.developer_ide import (
+            DeveloperIDEResult,
+        )
+
+        container_id = "c" * 64
+
+        self.sandbox.container_id = container_id
+        self.sandbox.status = "running"
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            mock_service.return_value.stop_ide.return_value = (
+                DeveloperIDEResult(True, container_id, "")
+            )
+
+            mock_service.return_value.inspect_ide.return_value = (
+                DeveloperIDEResult(True, "exited", "")
+            )
+
+            result = self.handler.handle_ide_operation(
+                self.make_request(SandboxOperation.STOP)
+            )
+
+        self.assertEqual(self.sandbox.status, "stopped")
+        self.assertEqual(result["status"], "completed")
+
+    def test_ide_start_failure_does_not_report_running(self):
+        """A failed Docker startup must not be reported as running."""
+
+        from unittest.mock import patch
+        from server_runner.sandbox_controller.developer_ide import (
+            DeveloperIDEResult,
+        )
+
+        self.sandbox.container_id = "d" * 64
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            mock_service.return_value.start_ide.return_value = (
+                DeveloperIDEResult(
+                    success=False,
+                    output="",
+                    error="Docker startup failed",
+                )
+            )
+
+            result = self.handler.handle_ide_operation(
+                self.make_request(SandboxOperation.START)
+            )
+
+        self.assertNotEqual(self.sandbox.status, "running")
+        self.assertEqual(result["status"], "failed")
+
+    def test_ide_missing_sandbox_never_calls_docker(self):
+        """Unauthorized sandbox requests must not reach Docker."""
+
+        from unittest.mock import patch
+
+        # Simulate an unknown or unauthorized sandbox.
+        self.db.execute.return_value.scalar_one_or_none.return_value = None
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            with self.assertRaises(PermissionError):
+                self.handler.handle_ide_operation(
+                    self.make_request(SandboxOperation.START)
+                )
+
+            mock_service.assert_not_called()
+
+    def test_ide_duplicate_request_never_calls_docker(self):
+        """A replayed operation must not execute Docker again."""
+
+        from unittest.mock import patch
+
+        from server_runner.sandbox_controller.replay import (
+            ReplayProtectionError,
+        )
+
+        self.sandbox.container_id = "e" * 64
+
+        # Simulate PostgreSQL rejecting a duplicate request ID.
+        self.handler.operation_service.replay_store.claim_request.side_effect = (
+            ReplayProtectionError("Duplicate request")
+        )
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            with self.assertRaises(ReplayProtectionError):
+                self.handler.handle_ide_operation(
+                    self.make_request(SandboxOperation.START)
+                )
+
+            mock_service.assert_not_called()
+
+    def test_ide_inspect_does_not_start_container(self):
+        """Inspecting an IDE must not start or stop Docker."""
+
+        from unittest.mock import patch
+        from server_runner.sandbox_controller.developer_ide import (
+            DeveloperIDEResult,
+        )
+
+        container_id = "f" * 64
+
+        self.sandbox.container_id = container_id
+        self.sandbox.status = "running"
+
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            mock_service.return_value.inspect_ide.return_value = (
+                DeveloperIDEResult(True, "running", "")
+            )
+
+            result = self.handler.handle_ide_operation(
+                self.make_request(SandboxOperation.INSPECT)
+            )
+
+            mock_service.return_value.start_ide.assert_not_called()
+            mock_service.return_value.stop_ide.assert_not_called()
+
+        self.assertEqual(result["docker_status"], "running")
         
 if __name__ == "__main__":
     unittest.main()
