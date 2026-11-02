@@ -1,14 +1,15 @@
 """Manage persistent, private workspaces for CodeView developers."""
 
 import os
+import subprocess
 from pathlib import Path
 
 
-# Root directory where CodeView stores developer environments.
-#
-# This directory lives on the host server, not inside Docker.
-# Therefore, stopping or removing a container does not delete
-# the developer's saved files.
+# ============================================================
+# 1. WORKSPACE CONFIGURATION
+# ============================================================
+
+# Root directory for persistent developer workspaces.
 WORKSPACE_ROOT = Path(
     os.environ.get(
         "CODEVIEW_WORKSPACE_ROOT",
@@ -16,26 +17,13 @@ WORKSPACE_ROOT = Path(
     )
 )
 
+# Linux user running the developer Docker container.
+DEVELOPER_UID = 10001
 
-# Directories used to persist a developer's environment.
-#
-# projects:
-#     Stores source code, Git repositories, and local branches.
-#
-# extensions:
-#     Stores installed code-server extensions.
-#
-# config:
-#     Stores code-server settings and user configuration.
-#
-# cache:
-#     Stores reusable application and package caches.
-#
-# local:
-#     Stores additional user-level application data.
-#
-# These directories will be mounted into the developer's
-# Docker container during a later development step.
+# Linux user running the CodeView workspace manager.
+HOST_UID = os.getuid()
+
+# Directories whose contents must survive container restarts.
 WORKSPACE_DIRECTORIES = (
     "projects",
     "extensions",
@@ -45,11 +33,14 @@ WORKSPACE_DIRECTORIES = (
 )
 
 
-def validate_workspace_id(value):
-    """Validate a developer or group ID."""
+# ============================================================
+# 2. VALIDATE WORKSPACE IDS
+# ============================================================
 
-    # IDs must be positive integers.
-    # Reject booleans because bool is a subclass of int in Python.
+def validate_workspace_id(value):
+    """Accept only positive integer IDs."""
+
+    # Reject booleans, strings, zero, and negative numbers.
     if type(value) is not int or value <= 0:
         raise ValueError(
             "Workspace IDs must be positive integers."
@@ -58,19 +49,16 @@ def validate_workspace_id(value):
     return value
 
 
+# ============================================================
+# 3. BUILD WORKSPACE PATHS
+# ============================================================
+
 def get_workspace_path(developer_id, group_id):
-    """Return the private workspace path for a developer and group."""
+    """Return a developer's private workspace path."""
 
-    # Validate the developer ID.
     developer_id = validate_workspace_id(developer_id)
-
-    # Validate the group ID.
     group_id = validate_workspace_id(group_id)
 
-    # Each developer gets a separate directory.
-    #
-    # Even developers in the same group have different
-    # workspaces, preventing accidental file sharing.
     return (
         WORKSPACE_ROOT
         / f"developer_{developer_id}"
@@ -79,65 +67,150 @@ def get_workspace_path(developer_id, group_id):
 
 
 def get_workspace_directory(developer_id, group_id, directory_name):
-    """Return the path of a supported workspace subdirectory."""
+    """Return a supported workspace subdirectory."""
 
-    # Only allow directory names defined by CodeView.
-    # This prevents callers from requesting arbitrary paths.
     if directory_name not in WORKSPACE_DIRECTORIES:
         raise ValueError(
             "Invalid workspace directory."
         )
 
-    # Get the developer's private workspace.
-    workspace_path = get_workspace_path(
-        developer_id,
-        group_id,
+    return (
+        get_workspace_path(developer_id, group_id)
+        / directory_name
     )
 
-    # Return the requested directory path.
-    return workspace_path / directory_name
 
+# ============================================================
+# 4. ACL HELPERS
+# ============================================================
+
+def set_access_acl(directory_path, uid, permissions):
+    """Grant a specific Linux user access to a directory."""
+
+    subprocess.run(
+        [
+            "setfacl",
+            "-m",
+            f"u:{uid}:{permissions}",
+            str(directory_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def set_default_acl(directory_path):
+    """
+    Configure permissions inherited by newly created files.
+
+    Both the host workspace manager and Docker developer
+    receive access to new files and directories.
+    """
+
+    subprocess.run(
+        [
+            "setfacl",
+            "-m",
+            (
+                f"d:u:{HOST_UID}:rwx,"
+                f"d:u:{DEVELOPER_UID}:rwx"
+            ),
+            str(directory_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def prepare_directory(directory_path):
+    """
+    Create a directory and configure its ACL permissions.
+
+    Existing directories are reused without changing
+    permissions recursively.
+    """
+
+    directory_path = Path(directory_path)
+
+    # Create the directory if it doesn't already exist.
+    directory_path.mkdir(
+        exist_ok=True,
+        mode=0o700,
+    )
+
+    # Grant the host user and Docker developer access.
+    set_access_acl(
+        directory_path,
+        HOST_UID,
+        "rwx",
+    )
+
+    set_access_acl(
+        directory_path,
+        DEVELOPER_UID,
+        "rwx",
+    )
+
+    # Ensure new files inherit access permissions.
+    set_default_acl(directory_path)
+
+
+# ============================================================
+# 5. CREATE PERSISTENT WORKSPACE
+# ============================================================
 
 def create_workspace(developer_id, group_id):
-    """Create persistent directories for a developer's workspace."""
+    """
+    Create or reuse a persistent developer workspace.
 
-    # Build the validated workspace path.
+    Existing source code and configuration are preserved.
+    """
+
     workspace_path = get_workspace_path(
         developer_id,
         group_id,
     )
 
-    # Create the developer's main workspace directory.
-    #
-    # exist_ok=True means existing workspaces are reused.
-    # This is important because developer files must survive
-    # container restarts.
-    workspace_path.mkdir(
+    developer_path = workspace_path.parent
+
+    # Create the workspace root if needed.
+    WORKSPACE_ROOT.mkdir(
         parents=True,
         exist_ok=True,
         mode=0o700,
     )
 
-    # Restrict access to the directory owner.
-    workspace_path.chmod(0o700)
+    # Create the developer's parent directory.
+    developer_path.mkdir(
+        exist_ok=True,
+        mode=0o700,
+    )
 
-    # Create all supported persistent directories.
+    # Allow Docker to traverse the parent directories.
+    # Traversal does not grant permission to list files.
+    set_access_acl(
+        WORKSPACE_ROOT,
+        DEVELOPER_UID,
+        "--x",
+    )
+
+    set_access_acl(
+        developer_path,
+        DEVELOPER_UID,
+        "--x",
+    )
+
+    # Prepare the main workspace.
+    prepare_directory(workspace_path)
+
+    # Prepare persistent subdirectories.
     for directory_name in WORKSPACE_DIRECTORIES:
 
-        # Build the subdirectory path.
         directory_path = workspace_path / directory_name
 
-        # Create it if it does not already exist.
-        directory_path.mkdir(
-            exist_ok=True,
-            mode=0o700,
-        )
+        prepare_directory(directory_path)
 
-        # Restrict access to its owner.
-        directory_path.chmod(0o700)
-
-    # Return the main workspace path.
-    #
-    # We preserve the original return value because
-    # other CodeView components already use this function.
+    # Preserve the original return type expected by the Runner.
     return workspace_path
