@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from uuid import uuid4
+from datetime import datetime, timedelta, timezone
 
 from server_runner.sandbox_controller.operation import (
     SandboxOperation,
@@ -35,12 +36,41 @@ class TestSandboxOperationHandler(unittest.TestCase):
             self.sandbox
         )
 
+        # Create the operation handler using the mocked database.
         self.handler = SandboxOperationHandler(self.db)
 
-        # Mock replay insertion while testing handler coordination.
-        self.handler.operation_service.replay_store.claim_request = (
-            MagicMock(return_value=True)
+        # Simulate successful PostgreSQL replay protection.
+        self.handler.replay_store.claim_request = MagicMock(
+            return_value=True
         )
+
+        # Give the mocked worker a valid lease owner.
+        self.lease_owner = uuid4()
+
+        # Simulate PostgreSQL returning an active IDE lease.
+        self.handler.replay_store.get_lease = MagicMock(
+            return_value={
+                "lease_owner": self.lease_owner,
+                "lease_expires_at": (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=120)
+                ),
+                "lease_generation": 1,
+                "status": "pending",
+            }
+        )
+
+        # Simulate PostgreSQL confirming lease ownership.
+        self.handler.replay_store.owns_lease = MagicMock(
+            return_value=True
+        )
+
+                # Simulate PostgreSQL successfully updating one operation.
+        #
+        # Our lease-fencing method checks result.rowcount.
+        # A value of 1 means the worker still owns the lease
+        # and PostgreSQL accepted the update.
+        self.db.execute.return_value.rowcount = 1
 
     def make_request(self, operation):
         """Build a valid sandbox operation request."""
@@ -415,6 +445,101 @@ class TestSandboxOperationHandler(unittest.TestCase):
             mock_service.return_value.stop_ide.assert_not_called()
 
         self.assertEqual(result["docker_status"], "running")
+        
+    def test_ide_missing_lease_is_rejected(self):
+        """Reject an IDE operation without a lease record."""
+
+        # Simulate PostgreSQL returning no lease.
+        self.handler.replay_store.get_lease.return_value = None
+
+        # The helper must reject the missing lease.
+        with self.assertRaises(RuntimeError):
+            self.handler._get_ide_lease(uuid4())
+
+    def test_ide_expired_lease_is_rejected(self):
+        """Reject an IDE operation whose ownership has expired."""
+
+        # Simulate PostgreSQL rejecting lease ownership.
+        self.handler.replay_store.owns_lease.return_value = False
+
+        # The handler must not accept an expired lease.
+        with self.assertRaises(RuntimeError):
+            self.handler._verify_ide_lease(
+                request_id=uuid4(),
+                lease_owner=self.lease_owner,
+                lease_generation=1,
+            )
+
+
+    def test_ide_expired_lease_cannot_save_result(self):
+        """
+        An expired worker must not save its Docker operation result.
+
+        PostgreSQL rejects the update by returning rowcount = 0.
+        The handler must roll back the transaction.
+        """
+
+        from unittest.mock import patch
+
+        from server_runner.sandbox_controller.developer_ide import (
+            DeveloperIDEResult,
+        )
+
+        # Simulate an existing Docker container.
+        container_id = "a" * 64
+
+        self.sandbox.container_id = container_id
+        self.sandbox.status = "running"
+
+        # Simulate PostgreSQL rejecting the operation update.
+        #
+        # rowcount = 0 means the lease no longer matches,
+        # has expired, or the operation has already completed.
+        self.db.execute.return_value.rowcount = 0
+
+        # Mock Docker so no real container is stopped.
+        with patch(
+            "server_runner.sandbox_controller.operation_handler.DeveloperIDEService"
+        ) as mock_service:
+
+            # Simulate Docker successfully stopping the container.
+            mock_service.return_value.stop_ide.return_value = (
+                DeveloperIDEResult(
+                    success=True,
+                    output=container_id,
+                    error="",
+                )
+            )
+
+            # Simulate Docker confirming the stopped state.
+            mock_service.return_value.inspect_ide.return_value = (
+                DeveloperIDEResult(
+                    success=True,
+                    output="exited",
+                    error="",
+                )
+            )
+
+            # PostgreSQL must reject the expired worker.
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "lease expired or ownership was lost",
+            ):
+                self.handler.handle_ide_operation(
+                    self.make_request(SandboxOperation.STOP)
+                )
+
+        # The handler must not commit the rejected result.
+        #
+        # Note: the initial operation claim was already committed,
+        # so we expect exactly one commit, not zero.
+        self.assertEqual(self.db.commit.call_count, 1)
+
+        # The rejected completion transaction must be rolled back.
+        self.assertGreaterEqual(
+            self.db.rollback.call_count,
+            1,
+        )
         
 if __name__ == "__main__":
     unittest.main()

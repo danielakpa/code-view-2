@@ -63,16 +63,74 @@ class SandboxOperationHandler:
     def __init__(self, db: Session):
         """Initialize the handler with a PostgreSQL database session."""
 
-        # Store the database session.
+        # Database connection.
         self.db = db
 
-        # Use PostgreSQL to prevent replayed operation requests.
+        # Keep a direct reference to the replay store.
+        self.replay_store = DatabaseReplayStore(db)
+
+        # Preserve existing authorization and replay protection.
         self.operation_service = SandboxOperationService(
-            replay_store=DatabaseReplayStore(db)
+            replay_store=self.replay_store
         )
 
-        # Reuse CodeView's existing sandbox lifecycle rules.
+        # Preserve existing lifecycle validation.
         self.lifecycle = SandboxLifecycle()
+
+    def _get_ide_lease(self, request_id):
+        """
+        Retrieve the lease belonging to an IDE operation.
+
+        This retrieves ownership information but does not
+        independently guarantee that the lease remains valid.
+        """
+
+        # Retrieve the operation's lease from PostgreSQL.
+        lease = self.replay_store.get_lease(request_id)
+
+        # Reject operations without a lease record.
+        if lease is None:
+            raise RuntimeError(
+                "IDE operation lease was not found."
+            )
+
+        # Reject operations without valid ownership information.
+        if (
+            lease["lease_owner"] is None
+            or lease["lease_generation"] < 1
+        ):
+            raise RuntimeError(
+                "IDE operation has no valid lease owner."
+            )
+
+        return lease
+
+    def _verify_ide_lease(
+        self,
+        request_id,
+        lease_owner,
+        lease_generation,
+    ):
+        """
+        Verify that the current worker still owns the IDE operation.
+
+        Reject expired, replaced, or completed leases.
+        """
+
+        # Ask PostgreSQL whether this worker still owns the lease.
+        owns_lease = self.replay_store.owns_lease(
+            request_id=request_id,
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+        # Prevent a worker that lost ownership from proceeding.
+        if not owns_lease:
+            raise RuntimeError(
+                "IDE operation lease expired or ownership was lost."
+            )
+
+        return True
 
     def handle(self, request: SandboxOperationRequest):
         """
@@ -244,35 +302,63 @@ class SandboxOperationHandler:
     # ========================================================
     # 4. PERSISTENT DOCKER IDE OPERATIONS
     # ========================================================
-
     def _update_ide_operation(
         self,
         request_id,
         status,
+        lease_owner,
+        lease_generation,
         error_message=None,
     ):
-        """Save the result of an IDE operation in PostgreSQL."""
+        """
+        Update an IDE operation only if this worker still owns it.
 
-        self.db.execute(
+        PostgreSQL checks lease ownership and updates the record
+        atomically, preventing an expired worker from completing it.
+        """
+
+        # Only final operation statuses are allowed here.
+        if status not in ("completed", "failed"):
+            raise ValueError(
+                "IDE operation must finish as completed or failed."
+            )
+
+        # Update the operation only when its lease is still valid.
+        result = self.db.execute(
             text(
                 """
                 UPDATE runner.sandbox_operation_requests
                 SET
                     status = :status,
-                    completed_at = CASE
-                        WHEN :status = 'pending' THEN NULL
-                        ELSE NOW()
-                    END,
+                    completed_at = NOW(),
                     error_message = :error_message
-                WHERE request_id = :request_id
+                WHERE
+                    request_id = :request_id
+                    AND status = 'pending'
+                    AND lease_owner = :lease_owner
+                    AND lease_generation = :lease_generation
+                    AND lease_expires_at > NOW()
                 """
             ),
             {
                 "request_id": request_id,
                 "status": status,
+                "lease_owner": lease_owner,
+                "lease_generation": lease_generation,
                 "error_message": error_message,
             },
         )
+
+        # PostgreSQL reports how many records were updated.
+        #
+        # Zero means this worker no longer owns the operation,
+        # the lease expired, or the operation already finished.
+        if result.rowcount != 1:
+            raise RuntimeError(
+                "IDE operation update rejected: "
+                "lease expired or ownership was lost."
+            )
+
 
     def handle_ide_operation(
         self,
@@ -405,13 +491,29 @@ class SandboxOperationHandler:
                 trusted_identity=trusted_identity,
             )
 
-            # START enters its transitional state.
+                       # START enters its transitional state.
             if request.operation == SandboxOperation.START:
                 sandbox.status = "starting"
 
-            # The replay store inserts the operation record.
-            # Its default status is 'pending'.
+            # Commit the operation claim and sandbox changes.
             self.db.commit()
+
+            # Retrieve the ownership lease assigned to this operation.
+            lease = self._get_ide_lease(request.request_id)
+
+            # Save ownership information for later verification.
+            lease_owner = lease["lease_owner"]
+            lease_generation = lease["lease_generation"]
+
+            # Confirm that this worker still owns the operation.
+            self._verify_ide_lease(
+                request_id=request.request_id,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
+            )
+
+            # Close the read transaction before executing Docker.
+            self.db.rollback()
 
         except Exception:
             self.db.rollback()
@@ -596,15 +698,23 @@ class SandboxOperationHandler:
                 # A failed startup must never appear as running.
                 sandbox.status = "failed"
 
-            # Save the operation's final result.
+            # Determine the final operation status.
+            operation_status = "completed" if success else "failed"
+
+            # Complete the operation only if this worker
+            # still owns the PostgreSQL lease.
             self._update_ide_operation(
                 request_id=request.request_id,
-                status="completed" if success else "failed",
+                status=operation_status,
+                lease_owner=lease_owner,
+                lease_generation=lease_generation,
                 error_message=error_message,
             )
 
+            # Save the sandbox changes and operation result
+            # together in one PostgreSQL transaction.
             self.db.commit()
-
+            
         except Exception:
             self.db.rollback()
             raise
