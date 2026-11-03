@@ -89,13 +89,53 @@ def prepare_ide_socket_directory(sandbox_id: UUID) -> Path:
                 "IDE socket directory has an unexpected owner."
             )
 
-        # Reject access by the group or other users.
-        if (
-            directory_info.st_mode & stat.S_IRWXG
-            or directory_info.st_mode & stat.S_IRWXO
-        ):
+        # Reject access by other users.
+        if directory_info.st_mode & stat.S_IRWXO:
             raise IDESocketError(
-                "IDE socket directory has unsafe permissions."
+                "IDE socket directory allows access to other users."
+            )
+
+        # Read the existing ACL before making changes.
+        acl_result = subprocess.run(
+            ["getfacl", "-cp", str(socket_directory)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        if acl_result.returncode != 0:
+            raise IDESocketError(
+                "Could not inspect IDE socket permissions."
+            )
+
+        # Convert ACL output into individual entries.
+        acl_entries = {
+            line.strip()
+            for line in acl_result.stdout.splitlines()
+            if line.strip()
+        }
+
+        # A newly created directory has no additional ACL.
+        initial_entries = {
+            "user::rwx",
+            "group::---",
+            "other::---",
+        }
+
+        # An existing, correctly configured directory has this ACL.
+        allowed_entries = {
+            "user::rwx",
+            f"user:{DEVELOPER_UID}:rwx",
+            "group::---",
+            "mask::rwx",
+            "other::---",
+        }
+
+        # Reject unexpected permissions before modifying anything.
+        if acl_entries not in (initial_entries, allowed_entries):
+            raise IDESocketError(
+                "IDE socket directory has unsafe ACL permissions."
             )
 
         # Grant the Docker developer UID access using Linux ACLs.
@@ -115,6 +155,32 @@ def prepare_ide_socket_directory(sandbox_id: UUID) -> Path:
         if result.returncode != 0:
             raise IDESocketError(
                 "Could not configure IDE socket permissions."
+            )
+
+        # Verify the ACL after applying permissions.
+        acl_result = subprocess.run(
+            ["getfacl", "-cp", str(socket_directory)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        if acl_result.returncode != 0:
+            raise IDESocketError(
+                "Could not verify IDE socket permissions."
+            )
+
+        acl_entries = {
+            line.strip()
+            for line in acl_result.stdout.splitlines()
+            if line.strip()
+        }
+
+        # Reject missing or unexpected ACL permissions.
+        if acl_entries != allowed_entries:
+            raise IDESocketError(
+                "IDE socket directory has unsafe ACL permissions."
             )
 
     except (OSError, subprocess.TimeoutExpired) as error:

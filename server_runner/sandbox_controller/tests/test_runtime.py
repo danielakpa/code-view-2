@@ -105,11 +105,24 @@ class TestDockerRuntime(unittest.TestCase):
 
             # The Dockerfile now starts code-server.
             # We must not override its CMD with sleep infinity.
-            self.assertEqual(
-                command[-1],
-                DEVELOPER_IMAGE,
+            # Verify the approved Docker image is used.
+            self.assertIn(DEVELOPER_IMAGE, command)
+
+            # Verify code-server starts using a Unix socket.
+            self.assertIn("code-server", command)
+            self.assertIn("--socket", command)
+            self.assertIn(
+                "/run/codeview-ide/ide.sock",
+                command,
             )
 
+            # Verify password authentication remains enabled.
+            self.assertIn("--auth", command)
+            self.assertIn("password", command)
+
+            # Verify the socket has restricted permissions.
+            self.assertIn("--socket-mode", command)
+            self.assertIn("0600", command)
             self.assertNotIn("sleep", command)
             self.assertNotIn("infinity", command)
 
@@ -168,6 +181,55 @@ class TestDockerRuntime(unittest.TestCase):
                     "target=/home/developer/.cache"
                 ),
                 mounts,
+            )
+
+    def test_ide_socket_mount(self):
+        """Verify each IDE mounts only its assigned socket directory."""
+
+        from server_runner.sandbox_controller.ide_socket import (
+            get_ide_socket_directory,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+
+            # Create a valid sandbox identifier.
+            sandbox_id = uuid4()
+
+            # Create the developer workspace.
+            workspace = self.create_test_workspace(directory)
+
+            # Build the Docker command.
+            command = self.runtime.build_create_command(
+                sandbox_id,
+                workspace,
+            )
+
+            # Calculate the expected socket directory.
+            socket_directory = get_ide_socket_directory(
+                sandbox_id
+            )
+
+            # Verify the correct socket directory is mounted.
+            expected_mount = (
+                f"type=bind,source={socket_directory},"
+                "target=/run/codeview-ide"
+            )
+
+            self.assertIn(
+                expected_mount,
+                command,
+            )
+
+            # Verify Docker networking remains disabled.
+            self.assertEqual(
+                command[command.index("--network") + 1],
+                "none",
+            )
+
+            # Never expose the host Docker socket.
+            self.assertNotIn(
+                "/var/run/docker.sock",
+                " ".join(command),
             )
 
     def test_missing_persistent_directory_is_rejected(self):

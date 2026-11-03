@@ -6,6 +6,8 @@ IMPORTANT:
 Docker commands are NOT executed in this step.
 """
 
+
+
 import re
 from pathlib import Path
 from uuid import UUID
@@ -14,6 +16,11 @@ from server_runner.sandbox_controller.security import (
     get_controller_security_config,
 )
 
+from server_runner.sandbox_controller.ide_socket import (
+    IDESocketError,
+    get_ide_socket_directory,
+    prepare_ide_socket_directory,
+)
 
 # Use a fixed developer image rather than accepting arbitrary images.
 DEVELOPER_IMAGE = "ghcr.io/danielakpa/codeview-developer:dev"
@@ -80,6 +87,17 @@ class DockerRuntime:
                     f"Persistent workspace directory missing: {directory_name}."
                 )
 
+            # Prepare the host directory for this sandbox's Unix socket.
+        # The directory is separate from developer project files.
+        try:
+            socket_directory = prepare_ide_socket_directory(
+                sandbox_id
+            )
+        except IDESocketError as error:
+            raise SandboxRuntimeError(
+                "Could not prepare IDE socket directory."
+            ) from error
+
         # Give every sandbox a unique Docker container name.
         container_name = f"codeview-{sandbox_id.hex}"
 
@@ -128,6 +146,15 @@ class DockerRuntime:
             "--tmpfs",
             "/tmp:rw,exec,nosuid,nodev,size=256m",
 
+            # Mount only this sandbox's Unix socket directory.
+            # Other sandbox socket directories are not mounted.
+            "--mount",
+            (
+                "type=bind,"
+                f"source={socket_directory},"
+                "target=/run/codeview-ide"
+            ),
+
             # Mount the developer's persistent workspace.
             #
             # Existing CodeView components expect /workspace,
@@ -156,20 +183,36 @@ class DockerRuntime:
                     f"target={container_path}"
                 ),
             ])
-
-        # Finish building the Docker command.
         command.extend([
-            # Set the working directory.
+            # Set the developer's working directory.
             "--workdir",
             "/workspace",
 
-            # Use the approved CodeView developer image.
+            # Use the approved developer image.
             DEVELOPER_IMAGE,
 
-            # Do not override the Dockerfile CMD.
-            # The image now starts code-server automatically.
-        ])
+            # Start code-server using a Unix socket.
+            # This replaces the image's default TCP listener.
+            "code-server",
 
+            "--socket",
+            "/run/codeview-ide/ide.sock",
+
+            # Restrict access to the socket owner.
+            "--socket-mode",
+            "0600",
+
+            # Keep code-server password authentication enabled.
+            "--auth",
+            "password",
+
+            # Disable unnecessary telemetry.
+            "--disable-telemetry",
+
+            # Open the developer workspace.
+            "/workspace",
+        ])
+        
         return command
 
     def build_start_command(self, container_id: str) -> list[str]:
