@@ -79,3 +79,71 @@ class SandboxControllerClient:
         """Retrieve the controller's security configuration."""
 
         return self._get("/internal/security")
+
+
+    def _post(self, path: str, payload: dict):
+        """Send an authenticated POST request to the controller."""
+
+        try:
+            # Connect to the trusted internal controller.
+            with httpx.Client(
+                base_url=self.base_url,
+                timeout=60.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+
+                # Send the JSON request.
+                response = client.post(
+                    path,
+                    json=payload,
+                    headers=self._headers(),
+                )
+
+                # Raise an exception if the controller rejects it.
+                response.raise_for_status()
+
+                # Return the controller's JSON response.
+                return response.json()
+
+        except (httpx.HTTPError, ValueError) as error:
+            raise SandboxControllerError(
+                "Sandbox Controller IDE request failed."
+            ) from error
+
+    def perform_ide_operation(
+        self,
+        request_id,
+        sandbox_id,
+        developer_id: int,
+        group_id: int,
+        operation: str,
+    ):
+        """Request a persistent IDE operation from the controller."""
+
+        # The Controller expects lowercase operation values.
+        allowed_operations = {
+            "create",
+            "start",
+            "stop",
+            "inspect",
+        }
+
+        # Require the exact supported operation.
+        if operation not in allowed_operations:
+            raise ValueError("Unsupported IDE operation.")
+
+        # Build the request using trusted backend information.
+        payload = {
+            "request_id": str(request_id),
+            "sandbox_id": str(sandbox_id),
+            "developer_id": developer_id,
+            "group_id": group_id,
+            "operation": operation,
+        }
+
+        # Send the request to the existing Controller endpoint.
+        return self._post(
+            "/internal/ide/operations",
+            payload,
+        )

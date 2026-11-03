@@ -7,6 +7,15 @@
 # Read configuration from environment variables.
 import os
 
+# Access persistent developer sandbox records.
+from server_runner.runner_service.models import SandboxRecord
+
+# Communicate with the Sandbox Controller for IDE operations.
+from server_runner.runner_service.controller_client import (
+    SandboxControllerClient,
+    SandboxControllerError,
+)
+
 # Prepare or retrieve a developer's private execution sandbox.
 from server_runner.runner_service.sandbox.manager import (
     SandboxManager,
@@ -108,6 +117,17 @@ class PrepareSandboxRequest(BaseModel):
     # Private development group verified by Django.
     group_id: int = Field(gt=0, strict=True)
 
+class EnsureIDERequest(BaseModel):
+    """
+    Identify the developer whose persistent IDE
+    should be created or started.
+    """
+
+    # Developer authenticated by Django.
+    developer_id: int = Field(gt=0, strict=True)
+
+    # Private group verified by Django.
+    group_id: int = Field(gt=0, strict=True)
 
 # ============================================================
 # 6. INTERNAL AUTHENTICATION
@@ -314,6 +334,130 @@ def prepare_developer_sandbox(
             status_code=503,
             detail="Sandbox preparation failed."
         ) from error
+
+
+@app.post("/internal/sandboxes/ensure-ide")
+def ensure_developer_ide(
+    request: EnsureIDERequest,
+    authenticated: bool = Depends(verify_runner_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Find the developer's persistent sandbox.
+
+    This first version checks the sandbox record.
+    Docker startup will be added in the next step.
+    """
+
+    # STEP 1: Find the developer's existing sandbox.
+    sandbox = (
+        db.query(SandboxRecord)
+        .filter(
+            SandboxRecord.developer_id == request.developer_id,
+            SandboxRecord.group_id == request.group_id,
+        )
+        .first()
+    )
+
+    # STEP 2: Reject requests without a prepared sandbox.
+    if sandbox is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Developer sandbox not found. Prepare it first.",
+        )
+
+    # STEP 3: Create the internal Controller client.
+    try:
+        controller = SandboxControllerClient()
+
+    except SandboxControllerError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Sandbox Controller is unavailable.",
+        ) from error
+
+    # STEP 4: Send an IDE operation to the Controller.
+    def perform_operation(operation):
+        """Execute an IDE operation and verify its result."""
+
+        try:
+            result = controller.perform_ide_operation(
+                request_id=uuid4(),
+                sandbox_id=sandbox.sandbox_id,
+                developer_id=sandbox.developer_id,
+                group_id=sandbox.group_id,
+                operation=operation,
+            )
+
+        except SandboxControllerError as error:
+            # Do not retry blindly if the response is lost.
+            raise HTTPException(
+                status_code=503,
+                detail="IDE operation could not be confirmed.",
+            ) from error
+
+        # The Controller can return HTTP 200 for a failed operation.
+        if result.get("status") != "completed":
+            raise HTTPException(
+                status_code=503,
+                detail="IDE operation failed.",
+            )
+
+        return result
+
+    # STEP 5: Create the IDE if no container exists.
+    if sandbox.container_id is None:
+
+        create_result = perform_operation("create")
+
+        # Confirm that Docker created the container.
+        if create_result.get("docker_status") != "created":
+            raise HTTPException(
+                status_code=503,
+                detail="Docker IDE creation was not confirmed.",
+            )
+
+        # Start the newly created container.
+        result = perform_operation("start")
+
+    else:
+        # STEP 6: Inspect the existing container.
+        inspection = perform_operation("inspect")
+
+        docker_status = inspection.get("docker_status")
+
+        if docker_status == "running":
+            # The IDE is already running.
+            return {
+                "sandbox_id": str(sandbox.sandbox_id),
+                "status": "running",
+                "ready": True,
+            }
+
+        if docker_status in {"created", "exited"}:
+            # Start the existing container.
+            result = perform_operation("start")
+
+        else:
+            # Do not recreate an unknown container automatically.
+            raise HTTPException(
+                status_code=503,
+                detail="Docker IDE is in an unexpected state.",
+            )
+
+    # STEP 7: Confirm successful startup.
+    if result.get("docker_status") != "running":
+        raise HTTPException(
+            status_code=503,
+            detail="Docker IDE startup was not confirmed.",
+        )
+
+    # STEP 8: Return the successful result.
+    return {
+        "sandbox_id": str(sandbox.sandbox_id),
+        "status": "running",
+        "ready": True,
+    }
 # ============================================================
 # 10. DISCONNECT RUNNER SESSION
 # ============================================================
