@@ -9,6 +9,8 @@ from fastapi import (
     Request,
 )
 
+from fastapi.concurrency import run_in_threadpool
+
 from pydantic import ValidationError
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -24,6 +26,7 @@ from server_runner.sandbox_controller.authentication import (
 
 from server_runner.runner_service.database import (
     get_db,
+    SessionLocal,
 )
 
 # ============================================================
@@ -106,6 +109,29 @@ def security_summary(
 # 7. IDE OPERATION ENDPOINT
 # ============================================================
 
+def execute_ide_operation(operation_request):
+    """
+    Execute an IDE operation with its own database session.
+
+    The session is created and closed inside the worker thread.
+    """
+
+    # Create a dedicated PostgreSQL session.
+    db = SessionLocal()
+
+    try:
+        # Initialize the IDE operation handler.
+        handler = SandboxOperationHandler(db)
+
+        # Execute Docker and save the operation result.
+        return handler.handle_ide_operation(
+            operation_request
+        )
+
+    finally:
+        # Always close the database session.
+        db.close()
+
 @app.post("/internal/ide/operations")
 async def ide_operation(
     http_request: Request,
@@ -113,11 +139,9 @@ async def ide_operation(
     # Only authenticated internal services can call this endpoint.
     authenticated: bool = Depends(verify_controller_token),
 
-    # Provide the database session.
-    db: Session = Depends(get_db),
 ):
     """
-    Validate and record a developer IDE operation.
+    Authorize and execute a developer IDE operation.
 
     Supported operations:
         CREATE
@@ -125,8 +149,8 @@ async def ide_operation(
         STOP
         INSPECT
 
-    IMPORTANT:
-    This endpoint does not execute Docker commands yet.
+    The operation handler manages Docker execution
+    and PostgreSQL operation tracking.
     """
 
     # --------------------------------------------------------
@@ -168,18 +192,19 @@ async def ide_operation(
             detail="Unsupported IDE operation.",
         )
 
-    # --------------------------------------------------------
-    # STEP 3: AUTHORIZE AND RECORD THE OPERATION
+      # --------------------------------------------------------
+    # STEP 3: AUTHORIZE AND EXECUTE THE IDE OPERATION
     # --------------------------------------------------------
 
     try:
-        # Use the existing PostgreSQL-backed operation handler.
-        handler = SandboxOperationHandler(db)
+              # Execute the IDE operation in a worker thread.
+        # The helper creates and closes its own database session.
+        result = await run_in_threadpool(
+            execute_ide_operation,
+            operation_request,
+        )
 
-        # Verify sandbox ownership, lifecycle, and replay protection.
-        result = handler.handle(operation_request)
-
-        # Return the recorded operation.
+        # Return the confirmed operation result.
         return result
 
     except ReplayProtectionError as error:
