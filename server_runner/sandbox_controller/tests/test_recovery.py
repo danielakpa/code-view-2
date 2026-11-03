@@ -58,7 +58,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
             stderr="",
         )
 
-        # Mock the recovery claim by default.
+        # Mock recovery lease claiming.
         self.claim_patcher = patch.object(
             self.recovery,
             "_claim_recovery_lease",
@@ -66,10 +66,25 @@ class TestSandboxRecoveryService(unittest.TestCase):
         )
 
         self.mock_claim = self.claim_patcher.start()
-
         self.addCleanup(self.claim_patcher.stop)
 
-        # Configure database responses for the final transaction:
+        # Mock the heartbeat to avoid real background threads.
+        self.heartbeat_patcher = patch(
+            "server_runner.sandbox_controller.recovery.IDELeaseHeartbeat"
+        )
+
+        self.mock_heartbeat_class = self.heartbeat_patcher.start()
+        self.addCleanup(self.heartbeat_patcher.stop)
+
+        self.mock_heartbeat = self.mock_heartbeat_class.return_value
+
+        # Simulate a healthy heartbeat.
+        self.mock_heartbeat.lost_lease = False
+
+        # Simulate successful lease renewal during handoff.
+        self.mock_heartbeat.stop_and_renew.return_value = True
+
+        # Configure database responses for finalization:
         #
         # 1. Lock sandbox.
         # 2. Verify recovery ownership.
@@ -83,6 +98,10 @@ class TestSandboxRecoveryService(unittest.TestCase):
             ),
             MagicMock(rowcount=1),
         ]
+
+    # ========================================================
+    # EXISTING RECOVERY TESTS
+    # ========================================================
 
     def test_start_recovery(self):
         """Recover an IDE that Docker successfully started."""
@@ -172,8 +191,6 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.assertEqual(result.status, "unresolved")
         self.assertEqual(self.sandbox.status, "starting")
 
-        # The recovery lease was claimed, but the operation
-        # must not be finalized.
         self.db.commit.assert_not_called()
 
     def test_container_identity_mismatch(self):
@@ -206,6 +223,7 @@ class TestSandboxRecoveryService(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
 
         self.ide_service.executor.execute.assert_not_called()
+        self.mock_heartbeat_class.assert_not_called()
 
     def test_invalid_request_id(self):
         """Reject invalid request IDs."""
@@ -287,11 +305,32 @@ class TestSandboxRecoveryService(unittest.TestCase):
 
         self.db.execute.assert_not_called()
 
+
+    def test_find_pending_operations_uses_batch_limit(self):
+        """Recovery must retrieve at most 50 operations per cycle."""
+
+        # Simulate PostgreSQL returning no pending operations.
+        self.db.execute.return_value.mappings.return_value.all.return_value = []
+
+        # Find pending operations.
+        results = self.recovery.find_pending_operations()
+
+        # Confirm the result is empty.
+        self.assertEqual(results, [])
+
+        # Get the SQL query and its parameters.
+        statement, parameters = self.db.execute.call_args.args
+
+        # Verify that SQL limits the number of operations.
+        self.assertIn("LIMIT :batch_size", str(statement))
+
+        # Verify that the limit is 50.
+        self.assertEqual(parameters["batch_size"], 50)
+
+        
     def test_lost_recovery_lease_cannot_finalize(self):
         """A recovery worker that loses ownership must not save."""
 
-        # First query finds the sandbox.
-        # Second query finds no matching lease owner.
         self.db.execute.side_effect = [
             MagicMock(
                 scalar_one_or_none=lambda: self.sandbox
@@ -328,6 +367,148 @@ class TestSandboxRecoveryService(unittest.TestCase):
             )
 
         self.db.rollback.assert_called()
+
+    # ========================================================
+    # NEW HEARTBEAT TESTS
+    # ========================================================
+
+    def test_heartbeat_starts_after_claim(self):
+        """Start heartbeat only after recovery claims ownership."""
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "completed")
+
+        self.mock_heartbeat_class.assert_called_once_with(
+            request_id=self.request_id,
+            lease_owner=self.lease_owner,
+            lease_generation=self.lease_generation,
+        )
+
+        self.mock_heartbeat.start.assert_called_once()
+
+    def test_heartbeat_stops_after_inspection(self):
+        """Heartbeat must stop after Docker inspection."""
+
+        self.recovery.recover_operation(
+            self.request_id
+        )
+
+        self.mock_heartbeat.stop_and_renew.assert_called_once()
+
+    def test_heartbeat_failure_prevents_finalization(self):
+        """A lost heartbeat must prevent database finalization."""
+
+        self.mock_heartbeat.lost_lease = True
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "skipped")
+
+        self.db.commit.assert_not_called()
+
+        # No final database queries should execute.
+        self.db.execute.assert_not_called()
+
+    def test_docker_exception_stops_heartbeat(self):
+        """Docker exceptions must not leave the heartbeat running."""
+
+        self.ide_service.executor.execute.side_effect = (
+            RuntimeError("Docker inspection crashed")
+        )
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "unresolved")
+        self.mock_heartbeat.stop_and_renew.assert_called_once()
+
+        self.db.commit.assert_not_called()
+
+    def test_heartbeat_start_failure_is_unresolved(self):
+        """A heartbeat that cannot start must not finalize recovery."""
+
+        # Simulate a heartbeat startup failure.
+        self.mock_heartbeat.start.side_effect = RuntimeError(
+            "Heartbeat thread failed"
+        )
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        # Recovery must not report success.
+        self.assertEqual(result.status, "unresolved")
+
+        # Verify that heartbeat startup was attempted.
+        self.mock_heartbeat.start.assert_called_once()
+
+        # Cleanup should run after startup failure.
+        self.mock_heartbeat.stop.assert_called_once()
+
+        # Final lease handoff must not happen.
+        self.mock_heartbeat.stop_and_renew.assert_not_called()
+
+        # No Docker inspection should occur.
+        self.ide_service.executor.execute.assert_not_called()
+
+        # No operation should be finalized.
+        self.db.commit.assert_not_called()
+
+    def test_heartbeat_handoff_before_database_finalization(self):
+        """Renew the lease before committing recovery."""
+
+        events = []
+
+        # Record when the heartbeat handoff happens.
+        self.mock_heartbeat.stop_and_renew.side_effect = (
+            lambda: events.append("lease_handoff") or True
+        )
+
+        # Record when PostgreSQL commits.
+        self.db.commit.side_effect = (
+            lambda: events.append("database_committed")
+        )
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        self.assertEqual(result.status, "completed")
+
+        self.assertEqual(
+            events,
+            [
+                "lease_handoff",
+                "database_committed",
+            ],
+        )
+    def test_failed_lease_handoff_prevents_finalization(self):
+        """Never finalize recovery when lease renewal fails."""
+
+        # Simulate a failed lease handoff.
+        self.mock_heartbeat.stop_and_renew.return_value = False
+
+        result = self.recovery.recover_operation(
+            self.request_id
+        )
+
+        # Recovery must not report success.
+        self.assertEqual(result.status, "skipped")
+
+        # No completed operation should be saved.
+        self.db.commit.assert_not_called()
+
+        # Finalization queries must not execute.
+        self.db.execute.assert_not_called()
+
+        # Verify the handoff was attempted.
+        self.mock_heartbeat.stop_and_renew.assert_called_once()
 
 
 if __name__ == "__main__":

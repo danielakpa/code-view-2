@@ -658,6 +658,113 @@ class TestRecoveryIntegration(unittest.TestCase):
             2,
         )
 
+    def test_lease_handoff_rejects_old_worker(self):
+        """
+        An expired worker cannot finalize after another
+        worker claims the recovery lease.
+        """
+
+        # Create an expired lease belonging to Worker A.
+        worker_a_owner = uuid4()
+
+        expired_time = datetime.now(timezone.utc) - timedelta(
+            minutes=5
+        )
+
+        self.create_records(
+            operation="start",
+            sandbox_status="starting",
+            container_id=self.container_id,
+            lease_owner=worker_a_owner,
+            lease_expires_at=expired_time,
+            lease_generation=1,
+        )
+
+        # Worker B uses a separate database session.
+        with Session(self.engine) as worker_b_db:
+
+            worker_b = SandboxRecoveryService(
+                worker_b_db,
+                MagicMock(),
+            )
+
+            # Worker B claims the expired operation.
+            claimed = worker_b._claim_recovery_lease(
+                request_id=self.request_id,
+                older_than_minutes=5,
+            )
+
+            # Confirm Worker B successfully claimed it.
+            self.assertIsNotNone(claimed)
+
+            self.assertEqual(
+                claimed["lease_generation"],
+                2,
+            )
+
+            self.assertNotEqual(
+                claimed["lease_owner"],
+                worker_a_owner,
+            )
+
+            # Worker A returns with its old lease.
+            with Session(self.engine) as worker_a_db:
+
+                worker_a = SandboxRecoveryService(
+                    worker_a_db,
+                    MagicMock(),
+                )
+
+                # Worker A must not finalize using
+                # the expired lease credentials.
+                with self.assertRaises(RuntimeError):
+                    worker_a._finish_operation(
+                        request_id=self.request_id,
+                        status="completed",
+                        lease_owner=worker_a_owner,
+                        lease_generation=1,
+                    )
+
+                # Discard Worker A's failed transaction.
+                worker_a_db.rollback()
+
+            # Worker B still owns the valid lease.
+            worker_b._finish_operation(
+                request_id=self.request_id,
+                status="completed",
+                lease_owner=claimed["lease_owner"],
+                lease_generation=claimed["lease_generation"],
+            )
+
+            # Commit Worker B's successful operation.
+            worker_b_db.commit()
+
+        # Read the final PostgreSQL records.
+        _, operation = self.read_records()
+
+        # Verify that the operation was completed.
+        self.assertEqual(
+            operation["status"],
+            "completed",
+        )
+
+        # Verify that Worker B remains the owner.
+        self.assertEqual(
+            operation["lease_owner"],
+            claimed["lease_owner"],
+        )
+
+        # Verify that the generation is still 2.
+        self.assertEqual(
+            operation["lease_generation"],
+            2,
+        )
+
+        # Verify that PostgreSQL saved completion time.
+        self.assertIsNotNone(
+            operation["completed_at"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,9 @@ class IDELeaseHeartbeat:
     # Renew every 30 seconds.
     RENEW_INTERVAL_SECONDS = 30
 
+    # Maximum time to wait for the heartbeat thread to stop.
+    STOP_TIMEOUT_SECONDS = 10
+
     def __init__(
         self,
         request_id: UUID,
@@ -31,38 +34,36 @@ class IDELeaseHeartbeat:
     ):
         """Prepare the lease heartbeat."""
 
-        # Identify the operation and its owner.
         self.request_id = request_id
         self.lease_owner = lease_owner
         self.lease_generation = lease_generation
 
-        # Signal the background worker to stop.
+        # Tell the heartbeat when to stop.
         self._stop_event = threading.Event()
 
-        # Track whether ownership was lost.
+        # Record whether the lease was lost.
         self._lost_lease = threading.Event()
 
-        # Store the background thread.
+        # Background thread responsible for renewal.
         self._thread = None
 
     @property
     def lost_lease(self):
-        """Check whether lease renewal failed."""
+        """Return True if lease ownership was lost."""
+
         return self._lost_lease.is_set()
 
     def _renew(self):
         """Renew the lease using a separate PostgreSQL session."""
 
-        # Get the existing session factory.
         session_factory = create_controller_session_factory()
 
-        # Create a session owned by this heartbeat thread.
         with session_factory() as db:
 
             replay_store = DatabaseReplayStore(db)
 
             try:
-                # Extend the lease only if ownership is valid.
+                # Renew only if this worker still owns the lease.
                 renewed = replay_store.renew_lease(
                     request_id=self.request_id,
                     lease_owner=self.lease_owner,
@@ -73,7 +74,7 @@ class IDELeaseHeartbeat:
                     db.rollback()
                     return False
 
-                # Save the new expiration time.
+                # Save the new lease expiration.
                 db.commit()
 
                 return True
@@ -82,15 +83,57 @@ class IDELeaseHeartbeat:
                 db.rollback()
                 raise
 
+    def stop_and_renew(self):
+        """
+        Stop the heartbeat and renew the lease one final time.
+
+        Returns True only when:
+        1. The heartbeat thread has stopped.
+        2. No heartbeat failure was detected.
+        3. The worker successfully renewed its lease.
+        """
+
+        # Stop the background heartbeat first.
+        self.stop()
+
+        # Never renew while another heartbeat thread
+        # might still be using the database.
+        if self.lost_lease:
+            return False
+
+        try:
+            # Give finalization a fresh lease.
+            renewed = self._renew()
+
+            if not renewed:
+                self._lost_lease.set()
+                return False
+
+            return True
+
+        except Exception:
+            # Database errors make the handoff unsafe.
+            self._lost_lease.set()
+
+            logger.exception(
+                "IDE lease handoff failed: %s",
+                self.request_id,
+            )
+
+            return False                
+
     def _run(self):
-        """Periodically renew the lease until stopped."""
+        """Keep renewing until stopped or ownership is lost."""
 
         while not self._stop_event.wait(
             self.RENEW_INTERVAL_SECONDS
         ):
+
             try:
-                # Attempt to extend the lease.
-                if not self._renew():
+                renewed = self._renew()
+
+                if not renewed:
+
                     self._lost_lease.set()
 
                     logger.error(
@@ -101,7 +144,7 @@ class IDELeaseHeartbeat:
                     return
 
             except Exception:
-                # Database failures must not be ignored.
+
                 self._lost_lease.set()
 
                 logger.exception(
@@ -112,7 +155,7 @@ class IDELeaseHeartbeat:
                 return
 
     def start(self):
-        """Start the heartbeat in a background thread."""
+        """Start renewing the lease in a background thread."""
 
         if self._thread is not None:
             raise RuntimeError(
@@ -128,9 +171,25 @@ class IDELeaseHeartbeat:
         self._thread.start()
 
     def stop(self):
-        """Stop the heartbeat and wait for it to finish."""
+        """Stop renewal and wait briefly for the thread."""
 
+        # Request the background thread to stop.
         self._stop_event.set()
 
         if self._thread is not None:
-            self._thread.join()
+
+            # Avoid waiting forever for a blocked database call.
+            self._thread.join(
+                timeout=self.STOP_TIMEOUT_SECONDS
+            )
+
+            # If the thread is still running, treat the
+            # lease as unsafe for further operations.
+            if self._thread.is_alive():
+
+                self._lost_lease.set()
+
+                logger.error(
+                    "IDE lease heartbeat did not stop: %s",
+                    self.request_id,
+                )

@@ -185,12 +185,15 @@ class DatabaseReplayStore:
         The caller owns the transaction.
         """
 
+        # Validate the request ID.
         if not isinstance(request_id, UUID):
             raise ValueError("Invalid request ID.")
 
+        # Validate the lease owner.
         if not isinstance(lease_owner, UUID):
             raise ValueError("Invalid lease owner.")
 
+        # Validate the lease generation.
         if (
             isinstance(lease_generation, bool)
             or not isinstance(lease_generation, int)
@@ -198,6 +201,17 @@ class DatabaseReplayStore:
         ):
             raise ValueError("Invalid lease generation.")
 
+        # Prevent waiting indefinitely for a PostgreSQL row lock.
+        #
+        # SET LOCAL applies only to the current transaction.
+        # PostgreSQL automatically resets it when the
+        # transaction commits or rolls back.
+        self.db.execute(
+            text("SET LOCAL lock_timeout = '5s'")
+        )
+
+        # Renew only when the operation is still pending
+        # and this worker still owns an unexpired lease.
         result = self.db.execute(
             text(
                 """
@@ -220,6 +234,8 @@ class DatabaseReplayStore:
             },
         )
 
+        # True means the operation lease was renewed.
+        # False means no matching active lease was found.
         return result.rowcount == 1
 
     def owns_lease(

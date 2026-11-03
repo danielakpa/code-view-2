@@ -24,6 +24,11 @@ def create_controller_session_factory():
     Create one reusable database session factory.
 
     SQLAlchemy manages a connection pool behind the engine.
+
+    PostgreSQL timeouts protect the Controller against:
+    1. Long-running SQL statements.
+    2. Excessive database lock waits.
+    3. Sessions left idle inside transactions.
     """
 
     # Read the Controller's dedicated database URL.
@@ -37,12 +42,45 @@ def create_controller_session_factory():
             "CODEVIEW_CONTROLLER_DATABASE_URL is not configured."
         )
 
+    # Configure PostgreSQL safety timeouts.
+    #
+    # statement_timeout:
+    # Cancel statements running longer than 30 seconds.
+    #
+    # lock_timeout:
+    # Cancel statements waiting more than 5 seconds
+    # to acquire a database lock.
+    #
+    # idle_in_transaction_session_timeout:
+    # Disconnect sessions that remain idle inside
+    # a transaction for more than 60 seconds.
+    postgres_options = (
+        "-c statement_timeout=30000 "
+        "-c lock_timeout=5000 "
+        "-c idle_in_transaction_session_timeout=60000"
+    )
+
     # Create the engine once per application process.
     engine = create_engine(
         database_url,
+
+        # Check whether pooled connections are still alive.
         pool_pre_ping=True,
+
+        # Maintain up to 5 regular connections.
         pool_size=5,
+
+        # Allow up to 5 additional temporary connections.
         max_overflow=5,
+
+        # Do not wait indefinitely for a pooled connection.
+        pool_timeout=10,
+
+        # Apply PostgreSQL timeout settings
+        # whenever a new connection is established.
+        connect_args={
+            "options": postgres_options,
+        },
     )
 
     # Create the reusable session factory.

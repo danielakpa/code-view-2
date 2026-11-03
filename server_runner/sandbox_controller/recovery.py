@@ -13,6 +13,10 @@ from server_runner.sandbox_controller.developer_ide import (
     DeveloperIDEService,
 )
 
+from server_runner.sandbox_controller.lease_heartbeat import (
+    IDELeaseHeartbeat,
+)
+
 
 # ============================================================
 # 1. RECOVERY RESULT
@@ -43,10 +47,11 @@ class SandboxRecoveryService:
         "stop",
         "inspect",
     }
-
     # Give recovery a temporary lease while inspecting Docker.
     RECOVERY_LEASE_SECONDS = 120
 
+    # Process at most 50 interrupted operations per recovery cycle.
+    RECOVERY_BATCH_SIZE = 50
     def __init__(
         self,
         db: Session,
@@ -108,15 +113,19 @@ class SandboxRecoveryService:
                   OR lease_expires_at <= NOW()
               )
 
-            ORDER BY created_at, request_id
+           ORDER BY created_at, request_id
+            LIMIT :batch_size
             """
         )
 
         try:
             rows = self.db.execute(
                 statement,
-                {"cutoff": cutoff},
-            ).mappings().all()
+            {
+                "cutoff": cutoff,
+                "batch_size": self.RECOVERY_BATCH_SIZE,
+            },
+        ).mappings().all()
 
             return list(rows)
 
@@ -419,18 +428,81 @@ class SandboxRecoveryService:
         lease_generation = claimed["lease_generation"]
 
         # ----------------------------------------------------
-        # STEP 2: INSPECT DOCKER OUTSIDE DATABASE LOCKS
+        # STEP 2: INSPECT DOCKER AND PREPARE LEASE HANDOFF
         # ----------------------------------------------------
+        # Create the heartbeat for this recovery operation.
+        #
+        # It uses the lease ownership information
+        # returned when we claimed the operation.
+        heartbeat = IDELeaseHeartbeat(
+            request_id=request_id,
+            lease_owner=lease_owner,
+            lease_generation=lease_generation,
+        )
+
+        container_id = None
+        docker_status = None
+        error = None
+
+        # Track whether the lease handoff succeeded.
+        handoff_successful = False
+        heartbeat_started = False
 
         try:
-            container_id, docker_status, error = (
-                self._inspect_container(sandbox_id)
-            )
+            # Start the background heartbeat.
+            heartbeat.start()
 
-        except Exception as inspection_error:
-            container_id = None
-            docker_status = None
-            error = str(inspection_error)
+            # Record successful startup.
+            heartbeat_started = True
+            try:
+                # Check the container's actual Docker state.
+                container_id, docker_status, error = (
+                    self._inspect_container(sandbox_id)
+                )
+
+            except Exception as inspection_error:
+                # Never assume Docker succeeded after an exception.
+                error = str(inspection_error)
+
+        except Exception as heartbeat_error:
+            error = f"Recovery heartbeat failed: {heartbeat_error}"
+
+        finally:
+            if heartbeat_started:
+                # Stop the heartbeat and renew the lease.
+                handoff_successful = heartbeat.stop_and_renew()
+
+            else:
+                # Do not renew a lease if startup failed.
+                heartbeat.stop()
+                
+            # Never finalize without a successful lease handoff.
+        if not handoff_successful or heartbeat.lost_lease:
+
+            # Discard any uncommitted database changes.
+            self.db.rollback()
+
+            # A heartbeat startup failure means recovery
+            # could not proceed after claiming the operation.
+            if not heartbeat_started:
+                recovery_status = "unresolved"
+
+            else:
+                # A failed handoff or lost lease means
+                # ownership is no longer safe to assume.
+                recovery_status = "skipped"
+
+            return RecoveryResult(
+                request_id=str(request_id),
+                sandbox_id=str(sandbox_id),
+                operation=operation_name,
+                status=recovery_status,
+                docker_status=docker_status,
+                message=(
+                    "Recovery lease handoff failed "
+                    "or ownership was lost."
+                ),
+            )
 
         if error:
             # Do not guess Docker's state after an inspection error.
