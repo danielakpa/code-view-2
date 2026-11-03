@@ -230,6 +230,12 @@ async def ide_operation(
 
     except SQLAlchemyError as error:
 
+        # TEMPORARY DEBUGGING:
+        # Print the full database error in the Controller terminal.
+        import traceback
+        traceback.print_exc()
+
+        # Keep internal database details hidden from API callers.
         raise HTTPException(
             status_code=503,
             detail="Sandbox authorization database unavailable.",

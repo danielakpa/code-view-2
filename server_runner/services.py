@@ -54,6 +54,30 @@ def authorize_private_group_access(user, group):
     # Authorization succeeded.
     return True
 
+def authorize_developer_ide_access(user, group, developer_id):
+    """
+    Verify that a developer can access their private Docker IDE.
+
+    Security rules:
+    1. The developer must belong to the private group.
+    2. The developer can access only their own IDE.
+    """
+
+    # STEP 1: Reuse CodeView's existing group authorization.
+    authorize_private_group_access(
+        user=user,
+        group=group,
+    )
+
+    # STEP 2: Verify that the requested IDE belongs to this developer.
+    if user.pk != developer_id:
+        raise PermissionError(
+            "You cannot access another developer's IDE."
+        )
+
+    # STEP 3: Authorization succeeded.
+    return True
+
 def authorize_code_board_execution(user, board_id):
     """
     Verify that a developer can execute a private Code Board.

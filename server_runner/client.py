@@ -301,3 +301,59 @@ class CodeExecutionRunnerClient:
             raise RunnerUnavailableError(
                 "Failed to communicate with the CodeView Runner."
             ) from error
+
+
+    async def ensure_ide(self, developer_id, group_id):
+        """
+        Ask the FastAPI Runner to create or start a developer's IDE.
+
+        Django must verify the developer's group membership
+        before calling this method.
+
+        The Runner communicates with the Sandbox Controller,
+        which manages the developer's Docker container.
+        """
+
+        # STEP 1: Prepare backend authentication.
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+        }
+
+        # STEP 2: Identify the developer's private workspace.
+        payload = {
+            "developer_id": developer_id,
+            "group_id": group_id,
+        }
+
+        # STEP 3: Request IDE startup from FastAPI.
+        try:
+            async with httpx.AsyncClient(
+                timeout=120.0,
+                trust_env=False,
+            ) as client:
+
+                response = await client.post(
+                    f"{self.base_url}/internal/sandboxes/ensure-ide",
+                    headers=headers,
+                    json=payload,
+                )
+
+                # Raise an exception if the Runner rejects the request.
+                response.raise_for_status()
+
+                # STEP 4: Return the IDE startup result.
+                return response.json()
+
+        except httpx.HTTPStatusError as error:
+
+            # The Runner returned an unsuccessful HTTP status.
+            raise RunnerUnavailableError(
+                "IDE startup request was rejected."
+            ) from error
+
+        except httpx.RequestError as error:
+
+            # The Runner could not be reached or timed out.
+            raise RunnerUnavailableError(
+                "Failed to communicate with the CodeView Runner."
+            ) from error

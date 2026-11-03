@@ -1268,20 +1268,43 @@ def code_board(request, group_id):
 
     # Ask the FastAPI Runner to prepare a private sandbox.
     # The developer's group membership has already been verified.
+       # ========================================================
+    # STEP 3: PREPARE AND START THE DEVELOPER'S DOCKER IDE
+    # ========================================================
+
     try:
+        # Create one Runner client for both operations.
+        runner_client = CodeExecutionRunnerClient()
+
+        # First, prepare the developer's persistent workspace.
         sandbox = async_to_sync(
-            CodeExecutionRunnerClient().prepare_sandbox
+            runner_client.prepare_sandbox
         )(
             developer_id=request.user.pk,
             group_id=group.pk,
         )
 
+        # Next, ask the Runner to create or start the Docker IDE.
+        ide = async_to_sync(
+            runner_client.ensure_ide
+        )(
+            developer_id=request.user.pk,
+            group_id=group.pk,
+        )
+
+        # Confirm that the Runner reports the IDE as ready.
+        if not ide.get("ready"):
+            return HttpResponse(
+                "Your development environment is not ready. "
+                "Please try again.",
+                status=503,
+            )
+
     except RunnerUnavailableError:
 
-        # Display an error if the Runner cannot prepare the sandbox.
-        # Do not expose internal service errors to the developer.
+        # Do not expose internal service errors or tokens.
         return HttpResponse(
-            "CodeView could not prepare your development environment. "
+            "CodeView could not start your development environment. "
             "Please try again.",
             status=503,
         )
