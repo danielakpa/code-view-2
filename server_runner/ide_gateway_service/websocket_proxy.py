@@ -136,23 +136,57 @@ async def proxy_ide_websocket(
             ]
 
             try:
-                # Stop when the first task finishes.
-                await asyncio.wait(
+                # Wait until forwarding or session monitoring finishes.
+                done, pending = await asyncio.wait(
                     tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-            finally:
-                # Cancel the remaining tasks.
-                for task in tasks:
-                    task.cancel()
+                # Check whether any completed task failed.
+                for task in done:
+                    if not task.cancelled():
+                        error = task.exception()
 
-                # Wait until all tasks finish.
+                        if error is not None:
+                            raise error
+
+                # Check whether the browser is still connected.
+                browser_task = tasks[0]
+
+                # Check whether the IDE stopped sending messages.
+                ide_task = tasks[1]
+
+                # Check whether the session monitor finished.
+                monitor_task = tasks[2]
+
+                # If the IDE disconnected first, close the browser.
+                if ide_task in done:
+                    try:
+                        await websocket.close(code=1011)
+                    except RuntimeError:
+                        pass
+
+                # If the browser disconnected first, cleanup
+                # happens in the finally block.
+                elif browser_task in done:
+                    pass
+
+                # The session monitor already closes the browser
+                # with code 1008 when authorization is lost.
+                elif monitor_task in done:
+                    pass
+
+            finally:
+                # Cancel every task that is still running.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+
+                # Wait for all cancelled tasks to finish.
                 await asyncio.gather(
                     *tasks,
                     return_exceptions=True,
                 )
-
     except WebSocketDisconnect:
         # The browser disconnected normally.
         pass
