@@ -90,5 +90,5 @@ CODEVIEW_CONTROLLER_TOKEN=UE_kd5niJWhUqfTWhOpHnrkBCweB1fHgufw6CdKFG7NgD3lOdjnpks
 
 psql -h localhost -U codeview_controller -d codeview_test_db -W
 nano ~/.pgpass
-localhost:5432:codeview_test_db:codeview_controller:YOUR_PASSWORD
+localhost:5432:codeview_test_db:codeview_controller:Danielakpa.10
 chmod 600 ~/.pgpass
