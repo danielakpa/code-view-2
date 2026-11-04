@@ -161,3 +161,53 @@ class SandboxRecord(Base):
         nullable=True,
         unique=True,
     )
+
+class IDEGrantConsumptionRecord(Base):
+    """
+    Record IDE authorization grants that have already been used.
+
+    A unique grant ID prevents the same authorization grant
+    from being consumed more than once.
+    """
+
+    # Store the table inside the Runner's PostgreSQL schema.
+    __tablename__ = "ide_grant_consumptions"
+    __table_args__ = {"schema": "runner"}
+
+    # STEP 1: Store the unique authorization grant ID.
+    # PostgreSQL rejects another record with the same ID.
+    grant_id: Mapped[str] = mapped_column(
+        String(128),
+        primary_key=True,
+    )
+
+    # STEP 2: Store the sandbox authorized by this grant.
+    sandbox_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+
+    # STEP 3: Store the developer who received the grant.
+    developer_id: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    # STEP 4: Store the developer's private group.
+    group_id: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    # STEP 5: Store when the grant expires.
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    # STEP 6: Record when the grant was consumed.
+    consumed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
