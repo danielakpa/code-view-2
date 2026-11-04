@@ -13,6 +13,10 @@ from server_runner.ide_gateway_service.websocket_proxy import (
     proxy_ide_websocket,
 )
 
+from server_runner.ide_gateway_service.sessions import (
+    ide_session_store,
+)
+
 
 class FakeIDEWebSocket:
     """Simulate the WebSocket connection to VS Code."""
@@ -27,13 +31,16 @@ class FakeIDEWebSocket:
     async def send(self, message):
         """Receive a message forwarded from the browser."""
 
+        # Save the message for later verification.
         self.received_messages.append(message)
 
-        # Simulate VS Code responding to the message.
+        # Simulate VS Code responding to binary data.
         if isinstance(message, bytes):
             await self.outgoing_messages.put(
                 b"IDE received binary"
             )
+
+        # Simulate VS Code responding to text.
         else:
             await self.outgoing_messages.put(
                 "IDE received: " + message
@@ -78,13 +85,18 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
     def setUp(self):
         """Prepare an isolated WebSocket test application."""
 
-        # Create a test sandbox.
+        # 1. Create a unique test sandbox.
         self.sandbox_id = uuid4()
 
-        # Create a fake IDE.
+        # 2. Create a valid session for this sandbox.
+        self.session_token = ide_session_store.create_session(
+            self.sandbox_id
+        )
+
+        # 3. Create a fake IDE.
         self.fake_ide = FakeIDEWebSocket()
 
-        # Create a small FastAPI application.
+        # 4. Create a small FastAPI application.
         self.app = FastAPI()
 
         sandbox_id = self.sandbox_id
@@ -94,14 +106,22 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
             websocket: WebSocket,
             path: str,
         ):
-            # Call the real WebSocket forwarding function.
+            """Forward test browser messages to the fake IDE."""
+
+            # Read the session token from the browser cookie.
+            session_token = websocket.cookies.get(
+                "codeview_ide_session"
+            )
+
+            # Call the real WebSocket proxy.
             await proxy_ide_websocket(
                 websocket=websocket,
                 sandbox_id=sandbox_id,
                 path=path,
+                session_token=session_token,
             )
 
-        # Replace filesystem checks with test values.
+        # 5. Replace filesystem checks with test values.
         self.socket_path_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
             "get_ide_socket_path",
@@ -114,25 +134,42 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
             return_value=None,
         )
 
-        # Replace the real IDE connection with our fake IDE.
+        # 6. Replace the real Unix socket connection.
         self.connection_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
-            "connect",
+            "unix_connect",
             return_value=FakeIDEConnection(self.fake_ide),
         )
 
+        # Start all three mocks.
         self.socket_path_patch.start()
         self.validate_patch.start()
-        self.connection_patch.start()
 
-        # Create the browser test client.
+        # Save the connection mock so we can inspect its calls.
+        self.mock_connection = self.connection_patch.start()
+
+        # 7. Create the browser test client.
         self.client = TestClient(self.app)
+
+        # 8. Attach the valid IDE session cookie.
+        self.client.cookies.set(
+            "codeview_ide_session",
+            self.session_token,
+            path="/test-ide",
+        )
 
     def tearDown(self):
         """Remove test resources."""
 
+        # Close the browser test client.
         self.client.close()
 
+        # Revoke the session created for this test.
+        ide_session_store.revoke_session(
+            self.session_token
+        )
+
+        # Restore the original functions.
         self.connection_patch.stop()
         self.validate_patch.stop()
         self.socket_path_patch.stop()
@@ -150,12 +187,13 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
             # Receive the simulated IDE response.
             response = websocket.receive_text()
 
+            # Verify the response.
             self.assertEqual(
                 response,
                 "IDE received: Hello VS Code",
             )
 
-        # Verify the IDE received the original message.
+        # Verify that the IDE received the original message.
         self.assertIn(
             "Hello VS Code",
             self.fake_ide.received_messages,
@@ -174,11 +212,13 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
             # Receive the simulated IDE response.
             response = websocket.receive_bytes()
 
+            # Verify the response.
             self.assertEqual(
                 response,
                 b"IDE received binary",
             )
 
+        # Verify that the IDE received the binary data.
         self.assertIn(
             b"binary-data",
             self.fake_ide.received_messages,
@@ -191,19 +231,60 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
             "/test-ide/editor?workspace=123"
         ) as websocket:
 
+            # Send a message to establish communication.
             websocket.send_text("test")
-            websocket.receive_text()
 
-        # Inspect the arguments supplied to the connection.
-        connection_mock = (
-            self.connection_patch.stop()
+            # Receive the IDE response.
+            response = websocket.receive_text()
+
+            self.assertEqual(
+                response,
+                "IDE received: test",
+            )
+
+        # Verify that the Unix socket connection was called.
+        self.mock_connection.assert_called_once()
+
+        # Get the arguments passed to unix_connect().
+        connection_arguments = (
+            self.mock_connection.call_args.kwargs
         )
 
-        # The connection itself was already verified by
-        # the successful message exchange.
-        self.assertTrue(
-            self.fake_ide.received_messages
+        # Verify that the correct IDE resource path was used.
+        self.assertEqual(
+            connection_arguments["uri"],
+            "ws://localhost/editor?workspace=123",
         )
+
+        # Verify that the correct Unix socket was selected.
+        self.assertEqual(
+            connection_arguments["path"],
+            "/tmp/test-ide.sock",
+        )
+
+    def test_missing_session_rejected(self):
+        """The proxy must reject connections without a session."""
+
+        # Remove the browser's session cookie.
+        self.client.cookies.clear()
+
+        # Attempt to connect without authentication.
+        from starlette.websockets import WebSocketDisconnect
+
+        with self.assertRaises(WebSocketDisconnect) as context:
+            with self.client.websocket_connect(
+                "/test-ide/editor"
+            ):
+                pass
+
+        # The proxy should reject the connection.
+        self.assertEqual(
+            context.exception.code,
+            1008,
+        )
+
+        # The fake IDE must never be contacted.
+        self.mock_connection.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
-"""Forward CodeView IDE WebSocket messages through Unix sockets."""
+"""Secure WebSocket forwarding between CodeView and developer IDEs."""
 
 import asyncio
 
 from uuid import UUID
 
 from fastapi import WebSocket, WebSocketDisconnect
-from websockets.asyncio.client import connect
+
+from websockets.asyncio.client import unix_connect
 from websockets.exceptions import ConnectionClosed
 
 from server_runner.ide_gateway_service.socket_connection import (
@@ -13,21 +14,24 @@ from server_runner.ide_gateway_service.socket_connection import (
     validate_ide_socket,
 )
 
+from server_runner.ide_gateway_service.sessions import (
+    ide_session_store,
+)
+
+
+# Check the developer's session every 5 seconds.
+SESSION_CHECK_INTERVAL = 5
+
 
 async def proxy_ide_websocket(
     websocket: WebSocket,
     sandbox_id: UUID,
     path: str = "",
+    session_token: str | None = None,
 ) -> None:
-    """
-    Forward WebSocket messages between a browser and code-server.
+    """Forward IDE messages while checking session authorization."""
 
-    IMPORTANT:
-    The caller must authenticate the browser session and validate
-    its Origin before calling this function.
-    """
-
-    # STEP 1: Reject invalid paths.
+    # 1. Reject unsafe resource paths.
     if (
         path.startswith("/")
         or "\\" in path
@@ -36,47 +40,54 @@ async def proxy_ide_websocket(
         await websocket.close(code=1008)
         return
 
-    # STEP 2: Find the sandbox's Unix socket.
+    # 2. Require a valid session belonging to this sandbox.
+    if not session_token:
+        await websocket.close(code=1008)
+        return
+
+    session = ide_session_store.get_session(session_token)
+
+    if session is None or session.sandbox_id != sandbox_id:
+        await websocket.close(code=1008)
+        return
+
+    # 3. Find the Unix socket belonging to this developer's IDE.
     try:
         socket_path = get_ide_socket_path(sandbox_id)
-
-        # Verify the endpoint is a Unix socket.
         validate_ide_socket(socket_path)
 
     except (OSError, ValueError):
         await websocket.close(code=1011)
         return
 
-    # STEP 3: Build the upstream WebSocket URL.
+    # 4. Construct the upstream WebSocket resource path.
     upstream_path = f"/{path}" if path else "/"
 
-    # Preserve the browser's query string.
     query_string = websocket.scope.get("query_string", b"")
 
     if query_string:
         upstream_path += "?" + query_string.decode("ascii")
 
-    # STEP 4: Connect to code-server through its Unix socket.
     try:
-        async with connect(
-            f"ws://localhost{upstream_path}",
-            unix=True,
+        # 5. Connect to code-server through its Unix socket.
+        async with unix_connect(
             path=str(socket_path),
+            uri=f"ws://localhost{upstream_path}",
             open_timeout=10,
             max_size=16 * 1024 * 1024,
         ) as upstream:
 
-            # Only accept the browser after connecting upstream.
+            # Accept the authenticated browser connection.
             await websocket.accept()
 
-            # STEP 5: Forward browser messages to code-server.
             async def browser_to_ide():
+                """Forward browser messages to the IDE."""
 
                 while True:
                     message = await websocket.receive()
 
                     if message["type"] == "websocket.disconnect":
-                        break
+                        return
 
                     if message.get("bytes") is not None:
                         await upstream.send(message["bytes"])
@@ -84,8 +95,8 @@ async def proxy_ide_websocket(
                     elif message.get("text") is not None:
                         await upstream.send(message["text"])
 
-            # STEP 6: Forward code-server messages to the browser.
             async def ide_to_browser():
+                """Forward IDE messages to the browser."""
 
                 async for message in upstream:
 
@@ -95,42 +106,61 @@ async def proxy_ide_websocket(
                     else:
                         await websocket.send_text(message)
 
-            # STEP 7: Run both directions concurrently.
+            async def monitor_session():
+                """Disconnect when the developer loses authorization."""
+
+                while True:
+
+                    # Wait before checking again.
+                    await asyncio.sleep(SESSION_CHECK_INTERVAL)
+
+                    # Retrieve the current session.
+                    current_session = ide_session_store.get_session(
+                        session_token
+                    )
+
+                    # A revoked or expired session is no longer valid.
+                    if (
+                        current_session is None
+                        or current_session.sandbox_id != sandbox_id
+                    ):
+                        # Close the browser connection.
+                        await websocket.close(code=1008)
+                        return
+
+            # 6. Run forwarding and session monitoring concurrently.
             tasks = [
                 asyncio.create_task(browser_to_ide()),
                 asyncio.create_task(ide_to_browser()),
+                asyncio.create_task(monitor_session()),
             ]
 
             try:
-                # Stop when either direction finishes.
+                # Stop when the first task finishes.
                 await asyncio.wait(
                     tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
             finally:
-                # Cancel any remaining forwarding tasks.
+                # Cancel the remaining tasks.
                 for task in tasks:
                     task.cancel()
 
+                # Wait until all tasks finish.
                 await asyncio.gather(
                     *tasks,
                     return_exceptions=True,
                 )
 
-    except (
-        OSError,
-        ConnectionClosed,
-        TimeoutError,
-        ValueError,
-    ):
-        # The connection may already be closed.
-        try:
-            await websocket.close(code=1011)
-        except RuntimeError:
-            pass
-
     except WebSocketDisconnect:
         # The browser disconnected normally.
         pass
-        
+
+    except (OSError, ConnectionClosed, TimeoutError, ValueError):
+        # The IDE connection failed or was interrupted.
+        try:
+            await websocket.close(code=1011)
+
+        except RuntimeError:
+            pass
