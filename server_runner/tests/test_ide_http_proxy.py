@@ -2,6 +2,8 @@
 
 import unittest
 
+import os
+
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -36,6 +38,19 @@ class TestIDEHTTPProxy(unittest.TestCase):
             self.session_token,
             path="/ide",
         )
+
+        # Configure the trusted IDE Origin for testing.
+        self.origin_patch = patch.dict(
+            os.environ,
+            {
+                "CODEVIEW_IDE_PUBLIC_ORIGIN": (
+                    "http://127.0.0.1:8002"
+                ),
+            },
+        )
+
+        # Activate the test environment configuration.
+        self.origin_patch.start()
 
     def tearDown(self):
         """Remove the test session."""
@@ -161,26 +176,34 @@ class TestIDEHTTPProxy(unittest.TestCase):
         "server_runner.ide_gateway_service.main.proxy_ide_http",
         new_callable=AsyncMock,
     )
+
+     
     def test_post_request_forwarded(self, mock_proxy):
         """POST requests should reach the authorized proxy."""
 
+        # Simulate a successful response from the IDE.
         mock_proxy.return_value = Response(
             content="Saved",
             status_code=200,
         )
 
+        # Send a POST request with a trusted Origin.
         response = self.client.post(
             "/ide/api/save",
             content=b"test-data",
+            headers={
+                "Origin": "http://127.0.0.1:8002",
+            },
         )
 
+        # Verify that the request was successful.
         self.assertEqual(response.status_code, 200)
 
+        # Verify that the correct IDE path was forwarded.
         self.assertEqual(
             mock_proxy.call_args.kwargs["path"],
             "api/save",
         )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,10 +10,18 @@ from fastapi import (
     status,
 )
 
+from fastapi import WebSocket
+
 from server_runner.ide_gateway_service.http_proxy import (
     proxy_ide_http,
 )
 
+import os
+from urllib.parse import urlsplit
+
+from server_runner.ide_gateway_service.websocket_proxy import (
+    proxy_ide_websocket,
+)
 
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
@@ -235,16 +243,175 @@ async def open_ide(
     sandbox_id: UUID = Depends(get_authorized_ide_sandbox),
 ):
     """
-    Forward authorized browser requests to the correct IDE.
+    Forward authenticated HTTP requests to the developer's IDE.
 
-    The browser cannot choose its own sandbox ID.
+    Protect state-changing requests against cross-origin attacks.
     """
 
-    # STEP 1: The dependency verifies the browser session.
-    # STEP 2: It returns the sandbox linked to that session.
-    # STEP 3: Forward the request through the sandbox's Unix socket.
+    # STEP 1: Identify the HTTP request method.
+    method = request.method.upper()
+
+    # STEP 2: Identify methods that can change IDE data.
+    unsafe_methods = {
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    }
+
+    # STEP 3: Read the browser's Origin header.
+    origin = request.headers.get("origin")
+
+    # STEP 4: Validate Origin whenever the browser supplies it.
+    if origin is not None:
+        if not is_allowed_websocket_origin(origin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Untrusted IDE request origin.",
+            )
+
+    # STEP 5: Require Origin for state-changing requests.
+    if method in unsafe_methods and origin is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="IDE request origin is required.",
+        )
+
+    # STEP 6: Forward the authorized request.
     return await proxy_ide_http(
         request=request,
         sandbox_id=sandbox_id,
         path=path,
+    )
+
+# STEP 14: Validate the browser's WebSocket Origin.
+def is_allowed_websocket_origin(origin: str | None) -> bool:
+    """
+    Accept only the explicitly configured IDE browser origin.
+
+    Example:
+        https://ide.example.com
+
+    Do not use the incoming Host header to decide which
+    origins are trusted.
+    """
+
+    # Read the trusted public IDE origin.
+    allowed_origin = os.environ.get(
+        "CODEVIEW_IDE_PUBLIC_ORIGIN",
+        "",
+    ).strip()
+
+    # Reject requests if the origin is not configured.
+    if not allowed_origin or not origin:
+        return False
+
+    try:
+        # Parse the configured origin.
+        expected = urlsplit(allowed_origin)
+
+        # Parse the browser's Origin header.
+        supplied = urlsplit(origin)
+
+        # Only accept HTTP or HTTPS origins.
+        if expected.scheme not in {"http", "https"}:
+            return False
+
+        # Origins must not contain paths, queries, or fragments.
+        for parsed in (expected, supplied):
+            if (
+                not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                return False
+
+        # Compare scheme, hostname, and port.
+        return (
+            supplied.scheme == expected.scheme
+            and supplied.hostname == expected.hostname
+            and supplied.port == expected.port
+        )
+
+    except ValueError:
+        # Reject malformed origins.
+        return False
+
+
+# STEP 15: Authenticate the WebSocket browser session.
+def get_websocket_sandbox(websocket: WebSocket) -> UUID | None:
+    """
+    Return the sandbox belonging to the browser session.
+
+    The browser cannot choose its own sandbox ID.
+    """
+
+    # Read the session cookie from the WebSocket request.
+    session_token = websocket.cookies.get(
+        "codeview_ide_session"
+    )
+
+    # Reject missing session tokens.
+    if not session_token:
+        return None
+
+    # Look up the session in our Gateway session store.
+    session = ide_session_store.get_session(
+        session_token
+    )
+
+    # Reject invalid, revoked, or expired sessions.
+    if session is None:
+        return None
+
+    # Return the authorized sandbox.
+    return session.sandbox_id
+
+# STEP 16: Handle authorized IDE WebSocket connections.
+@app.websocket("/ide/")
+@app.websocket("/ide/{path:path}")
+async def open_ide_websocket(
+    websocket: WebSocket,
+    path: str = "",
+):
+    """Connect a browser to its IDE while monitoring session validity."""
+
+    # Step 1: Read the browser's Origin header.
+    origin = websocket.headers.get("origin")
+
+    # Step 2: Reject requests from untrusted websites.
+    if not is_allowed_websocket_origin(origin):
+        await websocket.close(code=1008)
+        return
+
+    # Step 3: Read the browser's IDE session cookie.
+    session_token = websocket.cookies.get(
+        "codeview_ide_session"
+    )
+
+    # Step 4: Reject browsers without a session.
+    if not session_token:
+        await websocket.close(code=1008)
+        return
+
+    # Step 5: Check whether the session exists and is valid.
+    session = ide_session_store.get_session(session_token)
+
+    if session is None:
+        await websocket.close(code=1008)
+        return
+
+    # Step 6: Identify the developer's authorized sandbox.
+    sandbox_id = session.sandbox_id
+
+    # Step 7: Start forwarding WebSocket messages to the IDE.
+    # Session monitoring will be added inside the proxy.
+    await proxy_ide_websocket(
+        websocket=websocket,
+        sandbox_id=sandbox_id,
+        path=path,
+        session_token=session_token,
     )
