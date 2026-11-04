@@ -1,14 +1,17 @@
 """FastAPI application for the CodeView IDE Gateway."""
 
 from uuid import UUID
-
 from fastapi import (
     Cookie,
     Depends,
     FastAPI,
     HTTPException,
-    Response,
+    Request,
     status,
+)
+
+from server_runner.ide_gateway_service.http_proxy import (
+    proxy_ide_http,
 )
 
 
@@ -184,31 +187,29 @@ async def complete_ide_handoff(ticket: str):
     response.headers["Referrer-Policy"] = "no-referrer"
 
     return response
-
-# STEP 11: Protect the browser IDE entry point.
-@app.get("/ide/")
-async def open_ide(
+# STEP 12: Verify the developer's IDE browser session.
+def get_authorized_ide_sandbox(
     codeview_ide_session: str | None = Cookie(default=None),
 ):
     """
-    Verify the browser session before opening the IDE.
+    Find the sandbox belonging to an authorized IDE session.
 
-    This route does not proxy VS Code yet.
+    This dependency will be reused by our HTTP routes.
     """
 
-    # STEP 1: Check whether the browser supplied a session cookie.
+    # STEP 1: Reject requests without a session cookie.
     if not codeview_ide_session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="IDE session is missing.",
         )
 
-    # STEP 2: Look up the session in our session store.
+    # STEP 2: Look up the browser session.
     session = ide_session_store.get_session(
         codeview_ide_session
     )
 
-    # STEP 3: Reject invalid, revoked, or expired sessions.
+    # STEP 3: Reject invalid or expired sessions.
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -216,9 +217,34 @@ async def open_ide(
         )
 
     # STEP 4: Return the authorized sandbox identity.
-    # Later, this route will connect to the actual VS Code container.
-    return {
-        "authorized": True,
-        "sandbox_id": str(session.sandbox_id),
-        "message": "IDE session verified successfully.",
-    }
+    return session.sandbox_id
+
+
+# STEP 13: Forward requests to the developer's IDE.
+@app.api_route(
+    "/ide/",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+@app.api_route(
+    "/ide/{path:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def open_ide(
+    request: Request,
+    path: str = "",
+    sandbox_id: UUID = Depends(get_authorized_ide_sandbox),
+):
+    """
+    Forward authorized browser requests to the correct IDE.
+
+    The browser cannot choose its own sandbox ID.
+    """
+
+    # STEP 1: The dependency verifies the browser session.
+    # STEP 2: It returns the sandbox linked to that session.
+    # STEP 3: Forward the request through the sandbox's Unix socket.
+    return await proxy_ide_http(
+        request=request,
+        sandbox_id=sandbox_id,
+        path=path,
+    )
