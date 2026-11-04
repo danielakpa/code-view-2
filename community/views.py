@@ -1230,6 +1230,13 @@ def code_board(request, group_id):
     Source code is written and executed directly from the browser.
     We do not save temporary source code to PostgreSQL.
     """
+        # ========================================================
+    # STEP 1: ALLOW ONLY GET REQUESTS
+    # ========================================================
+
+    # Reject unsupported HTTP methods before starting Docker.
+    if request.method != "GET":
+        return HttpResponseNotAllowed(["GET"])
 
     # ========================================================
     # STEP 1: FIND THE DEVELOPMENT GROUP
@@ -1308,16 +1315,7 @@ def code_board(request, group_id):
             "Please try again.",
             status=503,
         )
-
-    # ========================================================
-    # STEP 3: DISABLE THE OLD SAVE CODE ENDPOINT
-    # ========================================================
-
-    # Reject POST requests to this page.
-    # Code execution uses the separate run_code_board endpoint.
-    if request.method != "GET":
-        return HttpResponseNotAllowed(["GET"])
-
+        
     # ========================================================
     # STEP 4: FIND THE CONNECTED GITHUB REPOSITORY
     # ========================================================
