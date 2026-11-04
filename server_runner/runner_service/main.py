@@ -78,7 +78,11 @@ from server_runner.runner_service.models import RunnerSessionRecord
 # Communicate with the Sandbox Controller.
 from server_runner.controller_client import ControllerClient
 
-
+# Verify and consume one-time IDE authorization grants.
+from server_runner.runner_service.ide_grants import (
+    IDEGrantRejected,
+    consume_ide_grant,
+)
 # ============================================================
 # 4. FASTAPI APPLICATION
 # ============================================================
@@ -129,6 +133,15 @@ class EnsureIDERequest(BaseModel):
     # Private group verified by Django.
     group_id: int = Field(gt=0, strict=True)
 
+class ConsumeIDEGrantRequest(BaseModel):
+    """Represent a signed IDE authorization grant."""
+
+    # The signed grant created after Django authorizes a developer.
+    grant: str = Field(
+        min_length=1,
+        max_length=4096,
+        strict=True,
+    )
 # ============================================================
 # 6. INTERNAL AUTHENTICATION
 # ============================================================
@@ -335,6 +348,37 @@ def prepare_developer_sandbox(
             detail="Sandbox preparation failed."
         ) from error
 
+@app.post("/internal/ide-grants/consume")
+def consume_developer_ide_grant(
+    request: ConsumeIDEGrantRequest,
+    authenticated: bool = Depends(verify_runner_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Verify and consume a one-time IDE authorization grant.
+
+    Only authenticated internal services may call this endpoint.
+    """
+
+    # STEP 1: Verify and consume the authorization grant.
+    try:
+        sandbox_id = consume_ide_grant(
+            db=db,
+            token=request.grant,
+        )
+
+    # STEP 2: Reject invalid, expired, or reused grants.
+    except IDEGrantRejected as error:
+        raise HTTPException(
+            status_code=403,
+            detail="IDE authorization denied.",
+        ) from error
+
+    # STEP 3: Return the authorized sandbox identity.
+    return {
+        "authorized": True,
+        "sandbox_id": str(sandbox_id),
+    }
 
 @app.post("/internal/sandboxes/ensure-ide")
 def ensure_developer_ide(
