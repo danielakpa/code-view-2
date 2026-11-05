@@ -168,6 +168,7 @@ async def complete_ide_handoff(ticket: str):
         developer_id=handoff.developer_id,
         group_id=handoff.group_id,
         sandbox_id=handoff.sandbox_id,
+        membership_generation=handoff.membership_generation,
     )
 
     # STEP 4: Redirect the browser to the IDE entry point.

@@ -28,11 +28,15 @@ class TestIDESessions(unittest.TestCase):
         # Generate a unique sandbox UUID.
         self.sandbox_id = uuid4()
 
+        # Generate a membership generation for this test.
+        self.membership_generation = uuid4()
+
     def create_test_session(
         self,
         developer_id=None,
         group_id=None,
         sandbox_id=None,
+        membership_generation=None,
     ):
         """Create a session using the default test identities."""
 
@@ -52,6 +56,11 @@ class TestIDESessions(unittest.TestCase):
                 if sandbox_id is None
                 else sandbox_id
             ),
+            membership_generation=(
+                self.membership_generation
+                if membership_generation is None
+                else membership_generation
+            ),
         )
 
     def test_create_session(self):
@@ -63,7 +72,7 @@ class TestIDESessions(unittest.TestCase):
         self.assertTrue(token)
 
     def test_get_valid_session(self):
-        """A valid session must preserve all three identities."""
+        """A valid session must preserve all four identities."""
 
         token = self.create_test_session()
 
@@ -71,19 +80,46 @@ class TestIDESessions(unittest.TestCase):
 
         self.assertIsNotNone(session)
 
+        # Verify the developer identity.
         self.assertEqual(
             session.developer_id,
             self.developer_id,
         )
 
+        # Verify the group identity.
         self.assertEqual(
             session.group_id,
             self.group_id,
         )
 
+        # Verify the sandbox identity.
         self.assertEqual(
             session.sandbox_id,
             self.sandbox_id,
+        )
+
+        # Verify the membership generation.
+        self.assertEqual(
+            session.membership_generation,
+            self.membership_generation,
+        )
+
+    def test_session_preserves_membership_generation(self):
+        """A session must preserve its membership generation."""
+
+        # Create a browser session.
+        token = self.create_test_session()
+
+        # Retrieve the stored session.
+        session = self.store.get_session(token)
+
+        # Confirm the session exists.
+        self.assertIsNotNone(session)
+
+        # Confirm the correct generation was stored.
+        self.assertEqual(
+            session.membership_generation,
+            self.membership_generation,
         )
 
     def test_invalid_token_rejected(self):
@@ -110,6 +146,7 @@ class TestIDESessions(unittest.TestCase):
             developer_id=original.developer_id,
             group_id=original.group_id,
             sandbox_id=original.sandbox_id,
+            membership_generation=original.membership_generation,
             created_at=original.created_at,
             expires_at=(
                 datetime.now(timezone.utc)
@@ -136,6 +173,22 @@ class TestIDESessions(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.create_test_session(
                 sandbox_id=UUID(int=0)
+            )
+
+    def test_invalid_membership_generation_rejected(self):
+        """An empty membership generation must be rejected."""
+
+        with self.assertRaises(ValueError):
+            self.create_test_session(
+                membership_generation=UUID(int=0)
+            )
+
+    def test_invalid_membership_generation_type_rejected(self):
+        """A membership generation must be a UUID object."""
+
+        with self.assertRaises(ValueError):
+            self.create_test_session(
+                membership_generation="invalid-generation"
             )
 
     def test_sessions_have_unique_tokens(self):

@@ -188,3 +188,30 @@ CODEVIEW_RUNNER_TOKEN = os.environ.get(
     "CODEVIEW_RUNNER_TOKEN",
     "",
 )
+
+# ============================================================
+# IDE GATEWAY CONFIGURATION
+# ============================================================
+
+# Internal address Django uses to communicate with the IDE Gateway.
+#
+# The Gateway manages secure browser access to developers'
+# private Docker IDE environments.
+#
+# Port 8002 is our proposed local development port.
+# It can be changed through the environment variable.
+CODEVIEW_IDE_GATEWAY_URL = os.environ.get(
+    "CODEVIEW_IDE_GATEWAY_URL",
+    "http://127.0.0.1:8002",
+)
+
+# Secret token shared between Django and the IDE Gateway.
+#
+# Django sends this token when requesting IDE authorization.
+# The Gateway verifies it before accepting the request.
+#
+# Never hardcode a real token or expose it to the browser.
+CODEVIEW_IDE_GATEWAY_TOKEN = os.environ.get(
+    "CODEVIEW_IDE_GATEWAY_TOKEN",
+    "",
+)

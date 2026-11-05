@@ -1,5 +1,8 @@
 """Database models for CodeView groups, memberships, and collaboration."""
 
+# Generate unique identifiers for each membership period.
+import uuid
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -98,7 +101,22 @@ class GroupMember(models.Model):
         default="member",
     )
 
+       # Record when the developer joined the group.
     joined_at = models.DateTimeField(auto_now_add=True)
+
+    # Give each membership period a unique identifier.
+    #
+    # Example:
+    # John joins Group 5 -> Generation A
+    # John leaves Group 5 -> Generation A becomes invalid
+    # John rejoins Group 5 -> Generation B
+    #
+    # Old IDE sessions tied to Generation A must not become
+    # valid again when John rejoins.
+    membership_generation = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
+    )
 
     class Meta:
         constraints = [

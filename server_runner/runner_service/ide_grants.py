@@ -31,9 +31,17 @@ class AuthorizedIDEIdentity:
     after the object has been created.
     """
 
+    # Identify the developer who owns the IDE.
     developer_id: int
+
+    # Identify the private development group.
     group_id: int
+
+    # Identify the developer's Docker sandbox.
     sandbox_id: UUID
+
+    # Identify the specific group membership used for authorization.
+    membership_generation: UUID
 
 
 def consume_ide_grant(
@@ -45,14 +53,24 @@ def consume_ide_grant(
 
     The grant must:
     1. Have a valid signature and expiration.
-    2. Match an existing developer sandbox.
-    3. Have an unused grant ID.
+    2. Contain a valid membership generation.
+    3. Match an existing developer sandbox.
+    4. Have an unused grant ID.
 
-    Return the verified developer, group, and sandbox identity.
+    Return the developer, group, sandbox, and signed
+    membership generation.
+
+    IMPORTANT:
+    This function does not yet check whether the membership
+    generation is still active in Django's database.
     """
 
-    # STEP 1: Verify the signed authorization grant.
+    # ========================================================
+    # STEP 1: VERIFY THE SIGNED AUTHORIZATION GRANT
+    # ========================================================
+
     try:
+        # Verify the grant's signature, expiration, and fields.
         payload = verify_ide_grant(token)
 
     except InvalidIDEGrant as error:
@@ -60,14 +78,35 @@ def consume_ide_grant(
             "Invalid or expired IDE authorization."
         ) from error
 
-    # STEP 2: Extract the verified grant information.
+    # ========================================================
+    # STEP 2: EXTRACT THE VERIFIED GRANT INFORMATION
+    # ========================================================
+
+    # Identify the developer's private Docker sandbox.
     sandbox_id = UUID(payload["sandbox_id"])
+
+    # Identify the developer requesting access.
     developer_id = payload["developer_id"]
+
+    # Identify the private development group.
     group_id = payload["group_id"]
+
+    # Identify this unique authorization grant.
     grant_id = payload["grant_id"]
 
-    # STEP 3: Verify that the sandbox belongs to this developer
-    # and this private development group.
+    # Convert the signed membership generation into a UUID.
+    #
+    # verify_ide_grant() has already validated its format.
+    membership_generation = UUID(
+        payload["membership_generation"]
+    )
+
+    # ========================================================
+    # STEP 3: VERIFY SANDBOX OWNERSHIP
+    # ========================================================
+
+    # Find a sandbox matching the signed developer,
+    # private group, and sandbox UUID.
     sandbox = (
         db.query(SandboxRecord)
         .filter(
@@ -84,13 +123,21 @@ def consume_ide_grant(
             "Sandbox ownership verification failed."
         )
 
-    # STEP 4: Confirm that the sandbox has a Docker container.
+    # ========================================================
+    # STEP 4: VERIFY THE DOCKER CONTAINER EXISTS
+    # ========================================================
+
+    # The developer must have an existing Docker IDE container.
     if sandbox.container_id is None:
         raise IDEGrantRejected(
             "Developer IDE has not been created."
         )
 
-    # STEP 5: Prepare the consumed-grant database record.
+    # ========================================================
+    # STEP 5: PREPARE THE CONSUMED-GRANT RECORD
+    # ========================================================
+
+    # Record the grant ID so it cannot be consumed twice.
     consumed_grant = IDEGrantConsumptionRecord(
         grant_id=grant_id,
         sandbox_id=sandbox_id,
@@ -102,25 +149,39 @@ def consume_ide_grant(
         ),
     )
 
-    # STEP 6: Save the consumed grant atomically.
-    # This prevents the same authorization grant from being reused.
+    # ========================================================
+    # STEP 6: CONSUME THE GRANT ATOMICALLY
+    # ========================================================
+
     try:
+        # Add the consumed grant to the database transaction.
         db.add(consumed_grant)
+
+        # PostgreSQL's unique constraint prevents duplicate
+        # grant IDs from being committed.
         db.commit()
 
     except IntegrityError as error:
-        # Undo the failed database transaction.
+        # Undo the failed transaction.
         db.rollback()
 
-        # Reject duplicate grant IDs.
+        # Reject grants that have already been consumed.
         raise IDEGrantRejected(
             "IDE authorization grant has already been used."
         ) from error
 
-    # STEP 7: Return all three verified identities.
-    # These will later be used to create secure browser sessions.
+    # ========================================================
+    # STEP 7: RETURN THE AUTHORIZED IDE IDENTITY
+    # ========================================================
+
+    # Return the developer, group, sandbox, and generation.
+    #
+    # The Gateway will use this information when creating
+    # a browser session. Current membership must still be
+    # checked against an authoritative source.
     return AuthorizedIDEIdentity(
         developer_id=developer_id,
         group_id=group_id,
         sandbox_id=sandbox_id,
+        membership_generation=membership_generation,
     )

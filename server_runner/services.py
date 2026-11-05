@@ -78,6 +78,40 @@ def authorize_developer_ide_access(user, group, developer_id):
     # STEP 3: Authorization succeeded.
     return True
 
+def get_developer_ide_membership_generation(user, group):
+    """
+    Return the current membership generation for IDE authorization.
+
+    This allows CodeView to distinguish a developer's current
+    group membership from previous memberships.
+    """
+
+    # STEP 1: Verify the developer can access the private group.
+    authorize_developer_ide_access(
+        user=user,
+        group=group,
+        developer_id=user.pk,
+    )
+
+    # STEP 2: Find the developer's current group membership.
+    membership = GroupMember.objects.filter(
+        group=group,
+        user=user,
+    ).first()
+
+    # STEP 3: Return the current membership generation.
+    if membership is not None:
+        return membership.membership_generation
+
+    # STEP 4: Group owners can be authorized without a
+    # GroupMember record. Do not invent a generation for them.
+    #
+    # Owner authorization needs a separate, persistent generation
+    # before we can safely issue generation-bound IDE sessions.
+    raise PermissionError(
+        "IDE membership generation is unavailable."
+    )
+
 def authorize_code_board_execution(user, board_id):
     """
     Verify that a developer can execute a private Code Board.

@@ -22,14 +22,27 @@ class IDESession:
     - One developer.
     - One private development group.
     - One sandbox.
+    - One membership generation.
 
     The raw session token is never stored.
     """
 
+    # Identify the developer who owns the IDE.
     developer_id: int
+
+    # Identify the private development group.
     group_id: int
+
+    # Identify the developer's Docker sandbox.
     sandbox_id: UUID
+
+    # Identify the membership used to authorize this session.
+    membership_generation: UUID
+
+    # Record when the session was created.
     created_at: datetime
+
+    # Record when the session expires.
     expires_at: datetime
 
 
@@ -41,6 +54,10 @@ class IDESessionStore:
 
     Production deployments with multiple Gateway workers
     will require shared storage for reliable revocation.
+
+    IMPORTANT:
+    Storing membership_generation does not automatically
+    verify whether the membership is still active.
     """
 
     def __init__(self):
@@ -56,51 +73,101 @@ class IDESessionStore:
         developer_id: int,
         group_id: int,
         sandbox_id: UUID,
+        membership_generation: UUID,
     ) -> str:
         """
         Create a browser session for a verified IDE identity.
 
         Returns a random token for a secure, HttpOnly cookie.
+
+        The caller must supply the membership generation
+        obtained from the verified IDE handoff.
         """
 
-        # STEP 1: Validate the developer identity.
+        # =====================================================
+        # STEP 1: VALIDATE THE DEVELOPER IDENTITY
+        # =====================================================
+
         if type(developer_id) is not int or developer_id <= 0:
             raise ValueError("Invalid developer identity.")
 
-        # STEP 2: Validate the group identity.
+        # =====================================================
+        # STEP 2: VALIDATE THE GROUP IDENTITY
+        # =====================================================
+
         if type(group_id) is not int or group_id <= 0:
             raise ValueError("Invalid group identity.")
 
-        # STEP 3: Validate the sandbox identity.
-        if not isinstance(sandbox_id, UUID) or sandbox_id.int == 0:
+        # =====================================================
+        # STEP 3: VALIDATE THE SANDBOX IDENTITY
+        # =====================================================
+
+        if (
+            not isinstance(sandbox_id, UUID)
+            or sandbox_id.int == 0
+        ):
             raise ValueError("Invalid sandbox identity.")
 
-        # STEP 4: Generate a cryptographically secure token.
+        # =====================================================
+        # STEP 4: VALIDATE THE MEMBERSHIP GENERATION
+        # =====================================================
+
+        # Reject missing, incorrectly typed, or empty generations.
+        if (
+            not isinstance(membership_generation, UUID)
+            or membership_generation.int == 0
+        ):
+            raise ValueError(
+                "Invalid IDE membership generation."
+            )
+
+        # =====================================================
+        # STEP 5: GENERATE A SECURE SESSION TOKEN
+        # =====================================================
+
+        # Generate a cryptographically secure random token.
         token = secrets.token_urlsafe(32)
 
-        # STEP 5: Hash the token before storing it.
+        # =====================================================
+        # STEP 6: HASH THE SESSION TOKEN
+        # =====================================================
+
+        # Never store the raw browser session token.
         token_hash = hashlib.sha256(
             token.encode("utf-8")
         ).hexdigest()
 
-        # STEP 6: Calculate session expiration.
+        # =====================================================
+        # STEP 7: CALCULATE SESSION EXPIRATION
+        # =====================================================
+
         now = datetime.now(timezone.utc)
 
+        # Create an immutable browser session.
         session = IDESession(
             developer_id=developer_id,
             group_id=group_id,
             sandbox_id=sandbox_id,
+            membership_generation=membership_generation,
             created_at=now,
             expires_at=now + timedelta(
                 minutes=SESSION_LIFETIME_MINUTES
             ),
         )
 
-        # STEP 7: Store the session safely.
+        # =====================================================
+        # STEP 8: STORE THE SESSION SAFELY
+        # =====================================================
+
+        # Protect the shared dictionary from concurrent writes.
         with self._lock:
             self._sessions[token_hash] = session
 
-        # STEP 8: Return the raw token to the caller.
+        # =====================================================
+        # STEP 9: RETURN THE SESSION TOKEN
+        # =====================================================
+
+        # The Gateway will place this token in a secure cookie.
         return token
 
     def get_session(self, token: str) -> IDESession | None:
@@ -108,6 +175,10 @@ class IDESessionStore:
         Return a valid session or None.
 
         Expired sessions are removed when accessed.
+
+        NOTE:
+        This currently checks token validity and expiration,
+        not whether the developer's membership remains active.
         """
 
         # STEP 1: Reject invalid tokens.

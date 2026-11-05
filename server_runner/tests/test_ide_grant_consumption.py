@@ -34,17 +34,22 @@ class TestIDEGrantConsumption(SimpleTestCase):
 
         self.secret_patch.start()
         self.addCleanup(self.secret_patch.stop)
-
-        # Create a fake developer and sandbox.
+        # Identify the developer and private development group.
         self.developer_id = 12
         self.group_id = 5
+
+        # Identify the developer's private Docker sandbox.
         self.sandbox_id = uuid4()
 
-        # Create a valid authorization grant.
+        # Identify the developer's current group membership.
+        self.membership_generation = uuid4()
+
+        # Create a signed grant containing the membership generation.
         self.token = create_ide_grant(
             developer_id=self.developer_id,
             group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
         # Create a fake database session.

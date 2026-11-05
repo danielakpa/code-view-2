@@ -27,6 +27,9 @@ class TestIDEGrantEndpoint(SimpleTestCase):
         # STEP 1: Create the FastAPI test client.
         self.client = TestClient(app)
 
+        # Close the client after each test.
+        self.addCleanup(self.client.close)
+
         # STEP 2: Use a temporary Runner authentication token.
         self.token_patch = patch.dict(
             os.environ,
@@ -77,22 +80,27 @@ class TestIDEGrantEndpoint(SimpleTestCase):
         "server_runner.runner_service.main.consume_ide_grant"
     )
     def test_valid_grant_accepted(self, mock_consume):
-        """Return all verified identities for an authorized grant."""
+        """Return all four verified identities for an authorized grant."""
 
-        # STEP 1: Prepare the expected developer and group.
+        # STEP 1: Prepare the developer and group identities.
         developer_id = 12
         group_id = 5
+
+        # STEP 2: Generate a unique sandbox identity.
         sandbox_id = uuid4()
 
-        # STEP 2: Simulate successful grant consumption.
-        # The Runner now returns an AuthorizedIDEIdentity object.
+        # STEP 3: Generate a unique membership generation.
+        membership_generation = uuid4()
+
+        # STEP 4: Simulate successful grant consumption.
         mock_consume.return_value = AuthorizedIDEIdentity(
             developer_id=developer_id,
             group_id=group_id,
             sandbox_id=sandbox_id,
+            membership_generation=membership_generation,
         )
 
-        # STEP 3: Send an authenticated request.
+        # STEP 5: Send an authenticated request.
         response = self.client.post(
             self.url,
             headers={
@@ -101,10 +109,10 @@ class TestIDEGrantEndpoint(SimpleTestCase):
             json={"grant": "valid-test-grant"},
         )
 
-        # STEP 4: Verify the request succeeded.
+        # STEP 6: Verify the request succeeded.
         self.assertEqual(response.status_code, 200)
 
-        # STEP 5: Verify all three identities are returned.
+        # STEP 7: Verify all four identities are returned.
         self.assertEqual(
             response.json(),
             {
@@ -112,10 +120,13 @@ class TestIDEGrantEndpoint(SimpleTestCase):
                 "developer_id": developer_id,
                 "group_id": group_id,
                 "sandbox_id": str(sandbox_id),
+                "membership_generation": str(
+                    membership_generation
+                ),
             },
         )
 
-        # STEP 6: Verify the grant was consumed exactly once.
+        # STEP 8: Verify the grant was consumed exactly once.
         mock_consume.assert_called_once_with(
             db=self.fake_db,
             token="valid-test-grant",
@@ -161,3 +172,9 @@ class TestIDEGrantEndpoint(SimpleTestCase):
 
         # FastAPI must reject an empty grant.
         self.assertEqual(response.status_code, 422)
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()

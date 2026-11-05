@@ -27,6 +27,10 @@ class TestIDEProtectedRoute(unittest.TestCase):
         # Create the FastAPI test client.
         self.client = TestClient(app)
 
+        # Generate the developer's membership generation.
+        self.membership_generation = uuid4()
+
+        
         # Define test identities.
         self.developer_id = 12
         self.group_id = 5
@@ -47,20 +51,21 @@ class TestIDEProtectedRoute(unittest.TestCase):
         self.client.close()
 
     def create_test_session(self, sandbox_id=None):
-        """Create an IDE session with a verified test identity."""
+        """Create an IDE session with all four identity values."""
 
         # Use the default sandbox unless another is provided.
         if sandbox_id is None:
             sandbox_id = self.sandbox_id
 
-        # Create a session containing developer, group and sandbox.
+        # Create a session with the developer's membership generation.
         token = ide_session_store.create_session(
             developer_id=self.developer_id,
             group_id=self.group_id,
             sandbox_id=sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
-        # Save the token so tearDown can revoke it.
+        # Save the token for cleanup after the test.
         self.tokens.append(token)
 
         return token

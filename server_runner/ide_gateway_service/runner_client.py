@@ -13,13 +13,22 @@ from server_runner.ide_gateway_service.config import (
 @dataclass(frozen=True)
 class VerifiedIDEIdentity:
     """
-    Store the developer, group, and sandbox identities
-    verified by the Runner.
+    Store the developer identity verified by the Runner.
+
+    frozen=True prevents ordinary modification after creation.
     """
 
+    # Identify the developer who owns the IDE.
     developer_id: int
+
+    # Identify the private development group.
     group_id: int
+
+    # Identify the developer's Docker sandbox.
     sandbox_id: UUID
+
+    # Identify the membership associated with this authorization.
+    membership_generation: UUID
 
 
 class RunnerAuthorizationError(Exception):
@@ -42,7 +51,7 @@ async def consume_grant_with_runner(
     3. Sandbox ownership.
     4. Whether the grant has already been used.
 
-    Return the verified developer, group, and sandbox identities.
+    Return all four verified identity values.
     """
 
     # STEP 1: Validate the supplied grant.
@@ -115,20 +124,34 @@ async def consume_grant_with_runner(
                 "Invalid developer or group identity."
             )
 
-        # Extract and validate the sandbox UUID.
+        # STEP 8: Extract and validate the sandbox UUID.
         sandbox_id = UUID(data["sandbox_id"])
 
         if sandbox_id.int == 0:
-            raise ValueError("Invalid sandbox UUID.")
+            raise ValueError(
+                "Invalid sandbox UUID."
+            )
+
+        # STEP 9: Extract and validate the membership UUID.
+        membership_generation = UUID(
+            data["membership_generation"]
+        )
+
+        # Reject an empty UUID.
+        if membership_generation.int == 0:
+            raise ValueError(
+                "Invalid membership generation."
+            )
 
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise RunnerUnavailableError(
             "Runner returned invalid authorization data."
         ) from error
 
-    # STEP 8: Return all three verified identities.
+    # STEP 10: Return all four verified identity values.
     return VerifiedIDEIdentity(
         developer_id=developer_id,
         group_id=group_id,
         sandbox_id=sandbox_id,
+        membership_generation=membership_generation,
     )

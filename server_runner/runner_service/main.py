@@ -347,6 +347,8 @@ def prepare_developer_sandbox(
             status_code=503,
             detail="Sandbox preparation failed."
         ) from error
+
+
 @app.post("/internal/ide-grants/consume")
 def consume_developer_ide_grant(
     request: ConsumeIDEGrantRequest,
@@ -358,7 +360,8 @@ def consume_developer_ide_grant(
 
     Only authenticated internal services may call this endpoint.
 
-    Return the verified developer, group, and sandbox identities.
+    Return the verified developer, group, sandbox,
+    and membership generation identities.
     """
 
     # STEP 1: Ask the Runner to verify and consume the grant.
@@ -375,12 +378,15 @@ def consume_developer_ide_grant(
             detail="IDE authorization denied.",
         ) from error
 
-    # STEP 3: Return all verified identities to the IDE Gateway.
+    # STEP 3: Return all four verified identities to the Gateway.
     return {
         "authorized": True,
         "developer_id": identity.developer_id,
         "group_id": identity.group_id,
         "sandbox_id": str(identity.sandbox_id),
+        "membership_generation": str(
+            identity.membership_generation
+        ),
     }
 
 @app.post("/internal/sandboxes/ensure-ide")

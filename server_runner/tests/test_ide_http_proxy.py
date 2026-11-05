@@ -1,14 +1,13 @@
 """Tests for CodeView IDE HTTP proxy routing."""
 
-import unittest
-
 import os
+import unittest
 
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from fastapi.testclient import TestClient
 from fastapi.responses import Response
+from fastapi.testclient import TestClient
 
 from server_runner.ide_gateway_service.main import app
 from server_runner.ide_gateway_service.sessions import (
@@ -22,46 +21,61 @@ class TestIDEHTTPProxy(unittest.TestCase):
     def setUp(self):
         """Prepare an isolated browser session."""
 
-        self.client = TestClient(app)
+        # STEP 1: Define the developer and group identities.
+        self.developer_id = 12
+        self.group_id = 5
 
-        # Create a sandbox identity.
+        # STEP 2: Generate a unique sandbox identity.
         self.sandbox_id = uuid4()
 
-        # Create a valid browser session.
-        self.session_token = ide_session_store.create_session(
-            developer_id=12,
-            group_id=5,
-            sandbox_id=self.sandbox_id,
-        )
+        # STEP 3: Generate the developer's membership generation.
+        self.membership_generation = uuid4()
 
-        # Configure the test client's browser cookie.
-        self.client.cookies.set(
-            "codeview_ide_session",
-            self.session_token,
-            path="/ide",
-        )
+        # STEP 4: Configure the trusted IDE Origin.
+        self.origin = "http://127.0.0.1:8002"
 
-        # Configure the trusted IDE Origin for testing.
         self.origin_patch = patch.dict(
             os.environ,
             {
-                "CODEVIEW_IDE_PUBLIC_ORIGIN": (
-                    "http://127.0.0.1:8002"
-                ),
+                "CODEVIEW_IDE_PUBLIC_ORIGIN": self.origin,
             },
         )
 
         # Activate the test environment configuration.
         self.origin_patch.start()
 
-    def tearDown(self):
-        """Remove the test session."""
+        # STEP 5: Create a valid browser session.
+        # The session must preserve all four identity values.
+        self.session_token = ide_session_store.create_session(
+            developer_id=self.developer_id,
+            group_id=self.group_id,
+            sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
+        )
 
+        # STEP 6: Create the browser test client.
+        self.client = TestClient(app)
+
+        # STEP 7: Attach the session cookie.
+        self.client.cookies.set(
+            "codeview_ide_session",
+            self.session_token,
+            path="/ide",
+        )
+
+    def tearDown(self):
+        """Remove the test session and restore the environment."""
+
+        # STEP 1: Revoke the browser session.
         ide_session_store.revoke_session(
             self.session_token
         )
 
+        # STEP 2: Close the browser test client.
         self.client.close()
+
+        # STEP 3: Restore the original environment.
+        self.origin_patch.stop()
 
     @patch(
         "server_runner.ide_gateway_service.main.proxy_ide_http",
@@ -80,11 +94,14 @@ class TestIDEHTTPProxy(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.text, "IDE ready")
 
-        # Confirm that the correct sandbox was selected.
+        # Confirm the correct sandbox was selected.
         self.assertEqual(
             mock_proxy.call_args.kwargs["sandbox_id"],
             self.sandbox_id,
         )
+
+        # Confirm the proxy was called once.
+        mock_proxy.assert_awaited_once()
 
     @patch(
         "server_runner.ide_gateway_service.main.proxy_ide_http",
@@ -104,6 +121,7 @@ class TestIDEHTTPProxy(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
+        # Confirm the nested resource path was forwarded.
         self.assertEqual(
             mock_proxy.call_args.kwargs["path"],
             "static/app.js",
@@ -122,6 +140,8 @@ class TestIDEHTTPProxy(unittest.TestCase):
         response = self.client.get("/ide/")
 
         self.assertEqual(response.status_code, 401)
+
+        # The unauthorized request must not reach the IDE.
         mock_proxy.assert_not_awaited()
 
     @patch(
@@ -131,8 +151,10 @@ class TestIDEHTTPProxy(unittest.TestCase):
     def test_invalid_session_rejected(self, mock_proxy):
         """Invalid sessions must not reach the proxy."""
 
+        # Remove the existing session cookie.
         self.client.cookies.clear()
 
+        # Replace it with an invalid session token.
         self.client.cookies.set(
             "codeview_ide_session",
             "invalid-token",
@@ -142,6 +164,8 @@ class TestIDEHTTPProxy(unittest.TestCase):
         response = self.client.get("/ide/")
 
         self.assertEqual(response.status_code, 401)
+
+        # The invalid session must not reach the IDE.
         mock_proxy.assert_not_awaited()
 
     @patch(
@@ -154,6 +178,7 @@ class TestIDEHTTPProxy(unittest.TestCase):
     ):
         """A browser must not choose another sandbox."""
 
+        # Generate a sandbox belonging to another developer.
         other_sandbox = uuid4()
 
         mock_proxy.return_value = Response(
@@ -168,7 +193,8 @@ class TestIDEHTTPProxy(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
-        # The Gateway must use the authenticated sandbox.
+        # The Gateway must ignore the supplied sandbox ID.
+        # It must use the sandbox stored in the session.
         self.assertEqual(
             mock_proxy.call_args.kwargs["sandbox_id"],
             self.sandbox_id,
@@ -178,8 +204,6 @@ class TestIDEHTTPProxy(unittest.TestCase):
         "server_runner.ide_gateway_service.main.proxy_ide_http",
         new_callable=AsyncMock,
     )
-
-     
     def test_post_request_forwarded(self, mock_proxy):
         """POST requests should reach the authorized proxy."""
 
@@ -194,7 +218,7 @@ class TestIDEHTTPProxy(unittest.TestCase):
             "/ide/api/save",
             content=b"test-data",
             headers={
-                "Origin": "http://127.0.0.1:8002",
+                "Origin": self.origin,
             },
         )
 
@@ -207,6 +231,6 @@ class TestIDEHTTPProxy(unittest.TestCase):
             "api/save",
         )
 
+
 if __name__ == "__main__":
     unittest.main()
-    

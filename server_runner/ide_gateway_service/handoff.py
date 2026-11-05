@@ -20,14 +20,24 @@ HANDOFF_LIFETIME_SECONDS = 30
 @dataclass(frozen=True)
 class IDEHandoff:
     """
-    Store the verified developer, group, and sandbox identities.
+    Store the verified developer, group, sandbox, and membership identities.
 
     The raw handoff ticket is never stored in plain text.
     """
 
+    # Identify the developer who owns the IDE.
     developer_id: int
+
+    # Identify the private development group.
     group_id: int
+
+    # Identify the developer's Docker sandbox.
     sandbox_id: UUID
+
+    # Identify the membership used to authorize this IDE.
+    membership_generation: UUID
+
+    # Identify when the handoff ticket expires.
     expires_at: datetime
 
 
@@ -78,29 +88,44 @@ class IDEHandoffStore:
         ):
             raise ValueError("Invalid sandbox identity.")
 
-        # STEP 4: Generate an unpredictable ticket.
+        # STEP 4: Validate the membership generation.
+        #
+        # An empty or invalid generation must never be
+        # accepted when creating a browser handoff ticket.
+        if (
+            not isinstance(identity.membership_generation, UUID)
+            or identity.membership_generation.int == 0
+        ):
+            raise ValueError(
+                "Invalid IDE membership generation."
+            )
+
+        # STEP 5: Generate an unpredictable ticket.
         ticket = secrets.token_urlsafe(32)
 
-        # STEP 5: Hash the ticket before storing it.
+        # STEP 6: Hash the ticket before storing it.
+        #
+        # Only the hash is stored in memory.
         ticket_hash = hashlib.sha256(
             ticket.encode("utf-8")
         ).hexdigest()
 
-        # STEP 6: Set a short expiration time.
+        # STEP 7: Set a short expiration time.
         expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=HANDOFF_LIFETIME_SECONDS
         )
 
-        # STEP 7: Store all verified identities.
+        # STEP 8: Store all verified identities.
         with self._lock:
             self._tickets[ticket_hash] = IDEHandoff(
                 developer_id=identity.developer_id,
                 group_id=identity.group_id,
                 sandbox_id=identity.sandbox_id,
+                membership_generation=identity.membership_generation,
                 expires_at=expires_at,
             )
 
-        # STEP 8: Return the one-time ticket.
+        # STEP 9: Return the one-time ticket.
         return ticket
 
     def consume_ticket(
@@ -124,6 +149,9 @@ class IDEHandoffStore:
         ).hexdigest()
 
         # STEP 3: Atomically remove the ticket.
+        #
+        # The lock prevents two threads from consuming
+        # the same ticket simultaneously.
         with self._lock:
             handoff = self._tickets.pop(
                 ticket_hash,

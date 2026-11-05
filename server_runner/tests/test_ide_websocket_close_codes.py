@@ -76,14 +76,22 @@ class TestIDEWebSocketCloseCodes(unittest.TestCase):
     def setUp(self):
         """Create an authenticated test environment."""
 
-        # Create a unique developer sandbox.
+              # STEP 1: Define the developer and group identities.
+        self.developer_id = 12
+        self.group_id = 5
+
+        # STEP 2: Create a unique developer sandbox.
         self.sandbox_id = uuid4()
 
-        # Create a valid IDE session.
+        # STEP 3: Generate the developer's membership generation.
+        self.membership_generation = uuid4()
+
+        # STEP 4: Create a valid IDE session with all four identities.
         self.session_token = ide_session_store.create_session(
-            developer_id=12,
-            group_id=5,
+            developer_id=self.developer_id,
+            group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
         # Create the simulated IDE.

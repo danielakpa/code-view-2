@@ -25,33 +25,40 @@ class TestIDEWebSocketAuth(unittest.TestCase):
     def setUp(self):
         """Prepare an isolated test environment."""
 
-        # Configure the trusted IDE browser origin.
+        # STEP 1: Define the trusted browser origin.
+        self.origin = "http://127.0.0.1:8002"
+
+        # STEP 2: Configure the trusted IDE browser origin.
         self.environment = patch.dict(
             os.environ,
             {
-                "CODEVIEW_IDE_PUBLIC_ORIGIN": (
-                    "http://127.0.0.1:8002"
-                ),
+                "CODEVIEW_IDE_PUBLIC_ORIGIN": self.origin,
             },
         )
 
         self.environment.start()
 
-        # Create a FastAPI test client.
-        self.client = TestClient(app)
+        # STEP 3: Define the developer and group identities.
+        self.developer_id = 12
+        self.group_id = 5
 
-        # Create a test sandbox.
+        # STEP 4: Generate a unique sandbox identity.
         self.sandbox_id = uuid4()
 
-        # Create a valid IDE browser session.
+        # STEP 5: Generate the developer's membership generation.
+        self.membership_generation = uuid4()
+
+        # STEP 6: Create a valid IDE browser session.
+        # All four identity values must be preserved.
         self.session_token = ide_session_store.create_session(
-            developer_id=12,
-            group_id=5,
+            developer_id=self.developer_id,
+            group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
-        # Define the trusted Origin.
-        self.origin = "http://127.0.0.1:8002"
+        # STEP 7: Create a FastAPI test client.
+        self.client = TestClient(app)
 
     def tearDown(self):
         """Clean up the test environment."""

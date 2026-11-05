@@ -37,17 +37,21 @@ class TestIDESessionSecurity(unittest.TestCase):
         # STEP 3: Generate a sandbox UUID.
         self.sandbox_id = uuid4()
 
-        # STEP 4: Create a browser session with all three identities.
+        # STEP 4: Generate the developer's membership generation.
+        self.membership_generation = uuid4()
+
+        # STEP 5: Create a browser session with all four identities.
         self.session_token = ide_session_store.create_session(
             developer_id=self.developer_id,
             group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
-        # STEP 5: Create a browser test client.
+        # STEP 6: Create a browser test client.
         self.client = TestClient(app)
 
-        # STEP 6: Attach the session cookie.
+        # STEP 7: Attach the session cookie.
         self.client.cookies.set(
             "codeview_ide_session",
             self.session_token,
@@ -57,9 +61,15 @@ class TestIDESessionSecurity(unittest.TestCase):
     def tearDown(self):
         """Remove test sessions and restore the environment."""
 
-        ide_session_store.revoke_session(self.session_token)
+        # Remove the test session.
+        ide_session_store.revoke_session(
+            self.session_token
+        )
 
+        # Close the browser test client.
         self.client.close()
+
+        # Restore the environment.
         self.environment.stop()
 
     @patch(
@@ -183,7 +193,7 @@ class TestIDESessionSecurity(unittest.TestCase):
         """
         Revoking a developer's group sessions must block IDE access.
 
-        This tests the Gateway's revocation mechanism.
+        This tests the Gateway's local revocation mechanism.
         """
 
         # STEP 1: Revoke all sessions for this developer in Group 5.

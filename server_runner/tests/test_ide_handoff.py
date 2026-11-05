@@ -31,11 +31,15 @@ class TestIDEHandoff(unittest.TestCase):
         self.group_id = 5
         self.sandbox_id = uuid4()
 
+        # Identify the developer's current group membership.
+        self.membership_generation = uuid4()
+
         # STEP 3: Create the identity verified by the Runner.
         self.identity = VerifiedIDEIdentity(
             developer_id=self.developer_id,
             group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
     def test_create_ticket(self):
@@ -78,6 +82,12 @@ class TestIDEHandoff(unittest.TestCase):
             self.sandbox_id,
         )
 
+        # Verify that the membership generation is preserved.
+        self.assertEqual(
+            result.membership_generation,
+            self.membership_generation,
+        )
+
     def test_ticket_cannot_be_reused(self):
         """A handoff ticket must work only once."""
 
@@ -114,6 +124,7 @@ class TestIDEHandoff(unittest.TestCase):
             developer_id=self.developer_id,
             group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
             expires_at=(
                 datetime.now(timezone.utc)
                 - timedelta(seconds=1)
@@ -143,6 +154,7 @@ class TestIDEHandoff(unittest.TestCase):
             developer_id=self.developer_id,
             group_id=self.group_id,
             sandbox_id=UUID(int=0),
+            membership_generation=self.membership_generation,
         )
 
         # The ticket store must reject the invalid identity.
@@ -167,6 +179,7 @@ class TestIDEHandoff(unittest.TestCase):
             developer_id=0,
             group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
         with self.assertRaises(ValueError):
@@ -180,8 +193,24 @@ class TestIDEHandoff(unittest.TestCase):
             developer_id=self.developer_id,
             group_id=0,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
+        with self.assertRaises(ValueError):
+            self.store.create_ticket(invalid_identity)
+
+    def test_invalid_membership_generation_rejected(self):
+        """Reject an empty membership generation UUID."""
+
+        # Create an identity with an invalid membership generation.
+        invalid_identity = VerifiedIDEIdentity(
+            developer_id=self.developer_id,
+            group_id=self.group_id,
+            sandbox_id=self.sandbox_id,
+            membership_generation=UUID(int=0),
+        )
+
+        # The ticket store must reject the invalid generation.
         with self.assertRaises(ValueError):
             self.store.create_ticket(invalid_identity)
 
@@ -195,6 +224,10 @@ class TestIDEHandoff(unittest.TestCase):
         # A frozen dataclass must reject field reassignment.
         with self.assertRaises(FrozenInstanceError):
             handoff.developer_id = 999
+
+        # The membership generation must also be immutable.
+        with self.assertRaises(FrozenInstanceError):
+            handoff.membership_generation = uuid4()
 
 
 if __name__ == "__main__":

@@ -78,23 +78,32 @@ class TestIDEWebSocketSession(unittest.TestCase):
     def setUp(self):
         """Prepare the test sandbox and browser."""
 
-        # Create a unique sandbox.
+        # STEP 1: Define the developer and group identities.
+        self.developer_id = 12
+        self.group_id = 5
+
+        # STEP 2: Create a unique sandbox.
         self.sandbox_id = uuid4()
 
-        # Create an authenticated IDE session.
+        # STEP 3: Generate a membership generation.
+        self.membership_generation = uuid4()
+
+        # STEP 4: Create an authenticated IDE session.
         self.session_token = ide_session_store.create_session(
-            developer_id=12,
-            group_id=5,
+            developer_id=self.developer_id,
+            group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
-        # Create a simulated IDE.
+        # STEP 5: Create a simulated IDE.
         self.fake_ide = FakeIDEWebSocket()
 
-        # Create an isolated FastAPI application.
+        # STEP 6: Create an isolated FastAPI application.
         self.app = FastAPI()
 
         sandbox_id = self.sandbox_id
+
         @self.app.websocket("/test-ide/{path:path}")
         async def test_ide_websocket(
             websocket: WebSocket,
@@ -102,10 +111,12 @@ class TestIDEWebSocketSession(unittest.TestCase):
         ):
             """Connect the test browser to the IDE proxy."""
 
+            # Read the session token from the browser cookie.
             session_token = websocket.cookies.get(
                 "codeview_ide_session"
             )
 
+            # Forward the connection to the IDE.
             await proxy_ide_websocket(
                 websocket=websocket,
                 sandbox_id=sandbox_id,
@@ -113,7 +124,7 @@ class TestIDEWebSocketSession(unittest.TestCase):
                 session_token=session_token,
             )
 
-        # Avoid accessing a real Unix socket.
+        # STEP 7: Avoid accessing a real Unix socket.
         self.socket_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
             "get_ide_socket_path",
@@ -126,35 +137,53 @@ class TestIDEWebSocketSession(unittest.TestCase):
             return_value=None,
         )
 
-        # Replace the real IDE with our fake connection.
+        # STEP 8: Replace the real IDE with our fake connection.
         self.connection_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
             "unix_connect",
             return_value=FakeIDEConnection(self.fake_ide),
         )
 
-        # Make session monitoring fast during tests.
+        # STEP 9: Make session monitoring fast during tests.
         self.interval_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
             "SESSION_CHECK_INTERVAL",
             0.05,
         )
 
-        # Activate all test patches.
+        # STEP 10: Activate all test patches.
         self.socket_patch.start()
         self.validation_patch.start()
         self.connection_patch.start()
         self.interval_patch.start()
 
-        # Create the test browser.
+        # STEP 11: Create the test browser.
         self.client = TestClient(self.app)
 
-        # Attach the authenticated session cookie.
+        # STEP 12: Attach the authenticated session cookie.
         self.client.cookies.set(
             "codeview_ide_session",
             self.session_token,
             path="/test-ide",
         )
+
+    def tearDown(self):
+        """Clean up after each test."""
+
+        # Revoke the test session.
+        ide_session_store.revoke_session(
+            self.session_token
+        )
+
+        # Close the test browser.
+        self.client.close()
+
+        # Restore the original functions.
+        self.interval_patch.stop()
+        self.connection_patch.stop()
+        self.validation_patch.stop()
+        self.socket_patch.stop()
+
     def test_expired_session_disconnects_active_websocket(self):
         """An expired session must disconnect an active WebSocket."""
 
@@ -181,7 +210,7 @@ class TestIDEWebSocketSession(unittest.TestCase):
                 return_value=None,
             ):
 
-                # Wait for the session monitor to detect expiration.
+                # Wait for the monitor to detect expiration.
                 with self.assertRaises(
                     WebSocketDisconnect
                 ) as context:
@@ -193,6 +222,7 @@ class TestIDEWebSocketSession(unittest.TestCase):
                     context.exception.code,
                     1008,
                 )
+
     def test_browser_disconnect_stops_websocket_forwarding(self):
         """Closing the browser connection stops IDE forwarding."""
 
@@ -212,7 +242,7 @@ class TestIDEWebSocketSession(unittest.TestCase):
                 "IDE received: Before disconnect",
             )
 
-            # Explicitly tell the Gateway that the browser is closing.
+            # Tell the Gateway that the browser is closing.
             websocket.close(code=1000)
 
         # Verify that the IDE received the original message.
@@ -220,23 +250,6 @@ class TestIDEWebSocketSession(unittest.TestCase):
             "Before disconnect",
             self.fake_ide.received_messages,
         )
-
-    def tearDown(self):
-        """Clean up after each test."""
-
-        # Revoke the test session.
-        ide_session_store.revoke_session(
-            self.session_token
-        )
-
-        # Close the test browser.
-        self.client.close()
-
-        # Restore the original functions.
-        self.interval_patch.stop()
-        self.connection_patch.stop()
-        self.validation_patch.stop()
-        self.socket_patch.stop()
 
     def test_revoked_session_disconnects_active_websocket(self):
         """Revoking a session must disconnect an active WebSocket."""

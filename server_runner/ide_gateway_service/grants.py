@@ -54,15 +54,19 @@ def _decode(value):
         raise InvalidIDEGrant("Invalid grant encoding.") from error
 
 
-def create_ide_grant(developer_id, group_id, sandbox_id):
+def create_ide_grant(
+    developer_id,
+    group_id,
+    sandbox_id,
+    membership_generation,
+):
     """
-    Create a signed authorization grant for one developer's IDE.
+    Create a signed grant for a developer's current group membership.
 
-    Call this only after Django has verified the developer's
-    membership and obtained the sandbox UUID from the Runner.
+    Django must authorize the developer before calling this function.
     """
 
-    # STEP 1: Validate the developer and group IDs.
+    # STEP 1: Validate developer and group IDs.
     if (
         type(developer_id) is not int
         or developer_id <= 0
@@ -75,39 +79,47 @@ def create_ide_grant(developer_id, group_id, sandbox_id):
     if not isinstance(sandbox_id, UUID) or sandbox_id.int == 0:
         raise ValueError("Invalid sandbox UUID.")
 
-    # STEP 3: Calculate the expiration time.
+    # STEP 3: Validate the membership generation.
+    if (
+        not isinstance(membership_generation, UUID)
+        or membership_generation.int == 0
+    ):
+        raise ValueError("Invalid membership generation.")
+
+    # STEP 4: Calculate the grant expiration.
     now = int(time.time())
 
-    # STEP 4: Create the grant payload.
+    # STEP 5: Include membership generation in the signed payload.
     payload = {
         "developer_id": developer_id,
         "group_id": group_id,
         "sandbox_id": str(sandbox_id),
+        "membership_generation": str(membership_generation),
         "issued_at": now,
         "expires_at": now + GRANT_LIFETIME_SECONDS,
         "grant_id": secrets.token_urlsafe(24),
     }
 
-    # STEP 5: Convert the payload into JSON bytes.
+    # STEP 6: Convert the payload into JSON.
     payload_bytes = json.dumps(
         payload,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
 
-    # STEP 6: Encode the payload.
+    # STEP 7: Encode the payload.
     encoded_payload = _encode(payload_bytes)
 
-    # STEP 7: Sign the encoded payload using HMAC-SHA256.
+    # STEP 8: Sign the payload using HMAC-SHA256.
     signature = hmac.new(
         _get_grant_secret(),
         encoded_payload.encode("ascii"),
         hashlib.sha256,
     ).digest()
 
-    # STEP 8: Return the signed grant.
+    # STEP 9: Return the signed grant.
     return f"{encoded_payload}.{_encode(signature)}"
-
+    
 
 def verify_ide_grant(token):
     """
@@ -157,6 +169,7 @@ def verify_ide_grant(token):
         "developer_id",
         "group_id",
         "sandbox_id",
+        "membership_generation",
         "issued_at",
         "expires_at",
         "grant_id",
@@ -186,6 +199,28 @@ def verify_ide_grant(token):
     if sandbox_id.int == 0:
         raise InvalidIDEGrant("Invalid sandbox UUID.")
 
+    # Validate the membership generation UUID.
+    try:
+        membership_generation = UUID(
+            payload["membership_generation"]
+        )
+    except (TypeError, ValueError, AttributeError) as error:
+        raise InvalidIDEGrant(
+            "Invalid membership generation."
+        ) from error
+
+    # Reject an empty UUID.
+    if membership_generation.int == 0:
+        raise InvalidIDEGrant(
+            "Invalid membership generation."
+        )
+
+    # Require the standard UUID representation.
+    if str(membership_generation) != payload["membership_generation"]:
+        raise InvalidIDEGrant(
+            "Invalid membership generation."
+        )
+        
     # STEP 8: Check the grant's validity period.
     now = int(time.time())
 

@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from server_runner.ide_gateway_service.websocket_proxy import (
     proxy_ide_websocket,
@@ -85,20 +86,28 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
     def setUp(self):
         """Prepare an isolated WebSocket test application."""
 
-        # 1. Create a unique test sandbox.
+        # STEP 1: Define the developer and group identities.
+        self.developer_id = 12
+        self.group_id = 5
+
+        # STEP 2: Create a unique test sandbox.
         self.sandbox_id = uuid4()
 
-        # 2. Create a valid session for this sandbox.
+        # STEP 3: Generate the developer's membership generation.
+        self.membership_generation = uuid4()
+
+        # STEP 4: Create a valid session with all four identities.
         self.session_token = ide_session_store.create_session(
-            developer_id=12,
-            group_id=5,
+            developer_id=self.developer_id,
+            group_id=self.group_id,
             sandbox_id=self.sandbox_id,
+            membership_generation=self.membership_generation,
         )
 
-        # 3. Create a fake IDE.
+        # STEP 5: Create a fake IDE.
         self.fake_ide = FakeIDEWebSocket()
 
-        # 4. Create a small FastAPI application.
+        # STEP 6: Create a small FastAPI application.
         self.app = FastAPI()
 
         sandbox_id = self.sandbox_id
@@ -123,7 +132,7 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
                 session_token=session_token,
             )
 
-        # 5. Replace filesystem checks with test values.
+        # STEP 7: Replace filesystem checks with test values.
         self.socket_path_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
             "get_ide_socket_path",
@@ -136,7 +145,7 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
             return_value=None,
         )
 
-        # 6. Replace the real Unix socket connection.
+        # STEP 8: Replace the real Unix socket connection.
         self.connection_patch = patch(
             "server_runner.ide_gateway_service.websocket_proxy."
             "unix_connect",
@@ -149,10 +158,11 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
 
         # Save the connection mock so we can inspect its calls.
         self.mock_connection = self.connection_patch.start()
-        
+
+        # STEP 9: Create the browser test client.
         self.client = TestClient(self.app)
 
-        # 8. Attach the valid IDE session cookie.
+        # STEP 10: Attach the valid IDE session cookie.
         self.client.cookies.set(
             "codeview_ide_session",
             self.session_token,
@@ -162,8 +172,10 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
     def tearDown(self):
         """Remove test resources."""
 
+        # Close the browser test client.
         self.client.close()
 
+        # Revoke the test session.
         ide_session_store.revoke_session(
             self.session_token
         )
@@ -191,6 +203,7 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
                 response,
                 "IDE received: Hello VS Code",
             )
+
             # Explicitly notify the proxy that the browser is closing.
             websocket.close(code=1000)
 
@@ -245,6 +258,7 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
                 response,
                 "IDE received: test",
             )
+
             # Explicitly close the browser WebSocket.
             websocket.close(code=1000)
 
@@ -275,8 +289,6 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
         self.client.cookies.clear()
 
         # Attempt to connect without authentication.
-        from starlette.websockets import WebSocketDisconnect
-
         with self.assertRaises(WebSocketDisconnect) as context:
             with self.client.websocket_connect(
                 "/test-ide/editor"
