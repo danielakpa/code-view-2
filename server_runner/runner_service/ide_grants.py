@@ -1,5 +1,6 @@
 """Validate and atomically consume IDE authorization grants."""
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -21,7 +22,24 @@ class IDEGrantRejected(PermissionError):
     """Raised when an IDE grant cannot be accepted."""
 
 
-def consume_ide_grant(db: Session, token: str) -> UUID:
+@dataclass(frozen=True)
+class AuthorizedIDEIdentity:
+    """
+    Store the verified identity of a developer's IDE.
+
+    frozen=True prevents ordinary changes to these values
+    after the object has been created.
+    """
+
+    developer_id: int
+    group_id: int
+    sandbox_id: UUID
+
+
+def consume_ide_grant(
+    db: Session,
+    token: str,
+) -> AuthorizedIDEIdentity:
     """
     Verify and consume a one-time IDE authorization grant.
 
@@ -30,10 +48,10 @@ def consume_ide_grant(db: Session, token: str) -> UUID:
     2. Match an existing developer sandbox.
     3. Have an unused grant ID.
 
-    Return the authorized sandbox UUID.
+    Return the verified developer, group, and sandbox identity.
     """
 
-    # STEP 1: Verify the signed grant.
+    # STEP 1: Verify the signed authorization grant.
     try:
         payload = verify_ide_grant(token)
 
@@ -42,13 +60,14 @@ def consume_ide_grant(db: Session, token: str) -> UUID:
             "Invalid or expired IDE authorization."
         ) from error
 
-    # STEP 2: Extract the trusted grant information.
+    # STEP 2: Extract the verified grant information.
     sandbox_id = UUID(payload["sandbox_id"])
     developer_id = payload["developer_id"]
     group_id = payload["group_id"]
     grant_id = payload["grant_id"]
 
-    # STEP 3: Verify the sandbox belongs to this developer and group.
+    # STEP 3: Verify that the sandbox belongs to this developer
+    # and this private development group.
     sandbox = (
         db.query(SandboxRecord)
         .filter(
@@ -59,6 +78,7 @@ def consume_ide_grant(db: Session, token: str) -> UUID:
         .first()
     )
 
+    # Reject grants that do not match an existing sandbox.
     if sandbox is None:
         raise IDEGrantRejected(
             "Sandbox ownership verification failed."
@@ -70,7 +90,7 @@ def consume_ide_grant(db: Session, token: str) -> UUID:
             "Developer IDE has not been created."
         )
 
-    # STEP 5: Prepare the consumed-grant record.
+    # STEP 5: Prepare the consumed-grant database record.
     consumed_grant = IDEGrantConsumptionRecord(
         grant_id=grant_id,
         sandbox_id=sandbox_id,
@@ -82,20 +102,25 @@ def consume_ide_grant(db: Session, token: str) -> UUID:
         ),
     )
 
-    # STEP 6: Attempt an atomic database insertion.
+    # STEP 6: Save the consumed grant atomically.
+    # This prevents the same authorization grant from being reused.
     try:
         db.add(consumed_grant)
         db.commit()
 
     except IntegrityError as error:
-        # Undo the failed transaction.
+        # Undo the failed database transaction.
         db.rollback()
 
-        # A duplicate grant ID indicates a replay attempt.
+        # Reject duplicate grant IDs.
         raise IDEGrantRejected(
             "IDE authorization grant has already been used."
         ) from error
 
-    # STEP 7: Return the authorized sandbox UUID.
-    return sandbox_id
-    
+    # STEP 7: Return all three verified identities.
+    # These will later be used to create secure browser sessions.
+    return AuthorizedIDEIdentity(
+        developer_id=developer_id,
+        group_id=group_id,
+        sandbox_id=sandbox_id,
+    )

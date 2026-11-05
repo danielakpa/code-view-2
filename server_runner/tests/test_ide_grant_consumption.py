@@ -9,7 +9,9 @@ from django.test import SimpleTestCase
 from sqlalchemy.exc import IntegrityError
 
 from server_runner.ide_gateway_service.grants import create_ide_grant
+
 from server_runner.runner_service.ide_grants import (
+    AuthorizedIDEIdentity,
     IDEGrantRejected,
     consume_ide_grant,
 )
@@ -58,17 +60,38 @@ class TestIDEGrantConsumption(SimpleTestCase):
         )
 
     def test_valid_grant_consumed(self):
-        """Accept a valid grant and save its consumption record."""
+        """Accept a valid grant and return the verified IDE identity."""
 
         result = consume_ide_grant(
             db=self.db,
             token=self.token,
         )
 
-        # The correct sandbox UUID must be returned.
-        self.assertEqual(result, self.sandbox_id)
+        # STEP 1: Verify the returned object type.
+        self.assertIsInstance(
+            result,
+            AuthorizedIDEIdentity,
+        )
 
-        # The consumed grant must be saved.
+        # STEP 2: Verify the developer identity.
+        self.assertEqual(
+            result.developer_id,
+            self.developer_id,
+        )
+
+        # STEP 3: Verify the private group identity.
+        self.assertEqual(
+            result.group_id,
+            self.group_id,
+        )
+
+        # STEP 4: Verify the sandbox identity.
+        self.assertEqual(
+            result.sandbox_id,
+            self.sandbox_id,
+        )
+
+        # STEP 5: Verify that the consumed grant was saved.
         self.db.add.assert_called_once()
         self.db.commit.assert_called_once()
 
@@ -82,6 +105,7 @@ class TestIDEGrantConsumption(SimpleTestCase):
             orig=Exception("duplicate key"),
         )
 
+        # A reused grant must raise an authorization error.
         with self.assertRaises(IDEGrantRejected):
             consume_ide_grant(
                 db=self.db,
@@ -99,13 +123,14 @@ class TestIDEGrantConsumption(SimpleTestCase):
             None
         )
 
+        # The grant must be rejected.
         with self.assertRaises(IDEGrantRejected):
             consume_ide_grant(
                 db=self.db,
                 token=self.token,
             )
 
-        # An unauthorized grant must not be saved.
+        # Unauthorized grants must never be saved.
         self.db.add.assert_not_called()
         self.db.commit.assert_not_called()
 
@@ -115,11 +140,13 @@ class TestIDEGrantConsumption(SimpleTestCase):
         # Simulate a sandbox that has not been created.
         self.sandbox.container_id = None
 
+        # Reject access to the missing Docker IDE.
         with self.assertRaises(IDEGrantRejected):
             consume_ide_grant(
                 db=self.db,
                 token=self.token,
             )
 
+        # Rejected grants must not be saved.
         self.db.add.assert_not_called()
         self.db.commit.assert_not_called()
