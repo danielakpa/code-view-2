@@ -387,5 +387,117 @@ class TestIDEWebSocketRaceConditions(unittest.TestCase):
         # Run the asynchronous test.
         asyncio.run(run_cancellation_test())
 
+    def test_server_cancellation_stops_all_background_tasks(self):
+        """Server cancellation must stop all WebSocket background tasks."""
+
+        from unittest.mock import AsyncMock
+
+        from server_runner.ide_gateway_service import (
+            websocket_proxy,
+        )
+
+        async def run_test():
+            """Start the proxy, cancel it, and inspect its tasks."""
+
+            # Simulate a browser connection.
+            browser = AsyncMock(spec=WebSocket)
+
+            browser.scope = {
+                "query_string": b"",
+            }
+
+            # Keep the browser waiting for incoming messages.
+            async def wait_for_browser_message():
+                await asyncio.Event().wait()
+
+            browser.receive.side_effect = wait_for_browser_message
+
+            # Track when the browser is accepted.
+            browser_accepted = asyncio.Event()
+
+            async def accept_browser():
+                browser_accepted.set()
+
+            browser.accept.side_effect = accept_browser
+
+            # Record tasks created by the Gateway.
+            created_tasks = []
+
+            # Save the original asyncio.create_task function.
+            original_create_task = asyncio.create_task
+
+            def track_task(coroutine):
+                """Record each background task created by the proxy."""
+
+                task = original_create_task(coroutine)
+
+                created_tasks.append(task)
+
+                return task
+
+            # Start the actual WebSocket proxy.
+            proxy_task = original_create_task(
+                websocket_proxy.proxy_ide_websocket(
+                    websocket=browser,
+                    sandbox_id=self.sandbox_id,
+                    path="editor",
+                    session_token=self.session_token,
+                )
+            )
+
+            try:
+                # Track tasks created while the proxy runs.
+                with patch.object(
+                    websocket_proxy.asyncio,
+                    "create_task",
+                    side_effect=track_task,
+                ):
+                    await asyncio.wait_for(
+                        browser_accepted.wait(),
+                        timeout=2,
+                    )
+
+                    # Cancel the running Gateway.
+                    proxy_task.cancel()
+
+                    # Cancellation must propagate.
+                    with self.assertRaises(
+                        asyncio.CancelledError
+                    ):
+                        await proxy_task
+
+                # The Gateway creates exactly three background tasks.
+                self.assertEqual(
+                    len(created_tasks),
+                    3,
+                )
+
+                # Every background task must be finished.
+                for task in created_tasks:
+                    self.assertTrue(
+                        task.done(),
+                    )
+
+                    self.assertTrue(
+                        task.cancelled(),
+                    )
+
+                # The IDE connection must also be closed.
+                self.assertTrue(
+                    self.fake_ide.closed
+                )
+
+            finally:
+                # Ensure the proxy is not left running.
+                if not proxy_task.done():
+                    proxy_task.cancel()
+
+                await asyncio.gather(
+                    proxy_task,
+                    return_exceptions=True,
+                )
+
+        asyncio.run(run_test())
+
 if __name__ == "__main__":
     unittest.main()

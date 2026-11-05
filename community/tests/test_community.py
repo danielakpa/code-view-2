@@ -2,7 +2,8 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 
-from .models import ProjectGroup, GroupMember
+# Import the models from the parent community package.
+from community.models import ProjectGroup, GroupMember
 
 
 class GroupManagementTests(TestCase):

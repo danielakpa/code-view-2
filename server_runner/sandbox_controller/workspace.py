@@ -47,10 +47,28 @@ def resolve_workspace(identity: SandboxIdentity) -> Path:
             "Developer workspace does not exist or cannot be resolved."
         ) from error
 
+    # ========================================
+    # VERIFY WORKSPACE PATH ISOLATION
+    # ========================================
+
     # Ensure the workspace stays inside the configured root.
     if not resolved_path.is_relative_to(root):
         raise SandboxWorkspaceError(
             "Workspace path escapes the configured workspace root."
+        )
+
+    # Build the expected path from the trusted developer
+    # and group IDs, without following symbolic links.
+    expected_path = (
+        root
+        / f"developer_{identity.developer_id}"
+        / f"group_{identity.group_id}"
+    )
+
+    # Reject paths redirected to another workspace.
+    if resolved_path != expected_path:
+        raise SandboxWorkspaceError(
+            "Workspace path does not match sandbox identity."
         )
 
     # Reject files and other non-directory paths.

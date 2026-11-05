@@ -1298,9 +1298,15 @@ def code_board(request, group_id):
             developer_id=request.user.pk,
             group_id=group.pk,
         )
+        # ========================================
+        # VERIFY THAT THE DOCKER IDE IS READY
+        # ========================================
 
-        # Confirm that the Runner reports the IDE as ready.
-        if not ide.get("ready"):
+        # The IDE must be running and fully ready.
+        if (
+            ide.get("status") != "running"
+            or ide.get("ready") is not True
+        ):
             return HttpResponse(
                 "Your development environment is not ready. "
                 "Please try again.",
@@ -2124,9 +2130,18 @@ def send_group_message(request, group_id):
         ),
     }
 
-    # Send the event after the database transaction commits.
+     # ========================================
+    # BROADCAST MESSAGE THROUGH WEBSOCKETS
+    # ========================================
+
+    # Send the event only after the database transaction commits.
     def broadcast_message():
 
+        # Check that Django Channels has a configured channel layer.
+        if channel_layer is None:
+            return
+
+        # Broadcast the new message to connected group members.
         async_to_sync(channel_layer.group_send)(
             room_group_name,
             {
@@ -2135,6 +2150,7 @@ def send_group_message(request, group_id):
             },
         )
 
+    # Register the broadcast after a successful database commit.
     transaction.on_commit(broadcast_message)
 
     # ========================================
@@ -2168,19 +2184,16 @@ def send_group_message(request, group_id):
 @require_POST
 def edit_group_message(request, group_id, message_id):
     """Edit a message and broadcast the change through WebSockets."""
-# DEBUG: Check whether Django recognizes the AJAX request.
-    print("EDIT REQUEST RECEIVED")
-    print("AJAX HEADER:", request.headers.get("X-Requested-With"))
+
     # ========================================
     # 1. CHECK IF REQUEST COMES FROM JAVASCRIPT
     # ========================================
 
     # AJAX requests receive JSON instead of redirects.
-# Check whether JavaScript sent this request.
     is_ajax = (
         request.headers.get("X-Requested-With") == "XMLHttpRequest"
-    )   
-
+    )
+ 
     # ========================================
     # 2. FIND THE GROUP
     # ========================================
@@ -2467,36 +2480,6 @@ def delete_group_message(request, group_id, message_id):
     # ========================================
 
     # Keep the original behavior for normal HTML forms.
-    messages.success(
-        request,
-        "Message deleted successfully.",
-    )
-
-    return redirect(
-        reverse(
-            "group_detail",
-            kwargs={"group_id": group.id},
-        ) + "#group-chat"
-    )
-    # Send the event after the database transaction commits.
-    def broadcast_deletion():
-        async_to_sync(channel_layer.group_send)(
-            room_group_name,
-            {
-                # Calls chat_message() inside consumers.py.
-                "type": "chat.message",
-
-                # Information sent to connected browsers.
-                "data": message_data,
-            },
-        )
-
-    transaction.on_commit(broadcast_deletion)
-
-    # ========================================
-    # 6. RETURN TO GROUP CHAT
-    # ========================================
-
     messages.success(
         request,
         "Message deleted successfully.",

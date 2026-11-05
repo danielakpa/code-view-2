@@ -127,5 +127,30 @@ class TestSandboxWorkspace(unittest.TestCase):
             resolve_workspace(self.identity)
 
 
+    def test_cross_developer_symlink_is_rejected(self):
+        """A workspace cannot redirect to another developer's workspace."""
+
+        # Create Developer 2's workspace inside the same root.
+        other_workspace = (
+            self.root
+            / "developer_2"
+            / "group_2"
+        )
+
+        other_workspace.mkdir(parents=True)
+
+        # Create Developer 1's parent directory.
+        self.workspace.parent.mkdir(parents=True)
+
+        # Redirect Developer 1's workspace to Developer 2's workspace.
+        self.workspace.symlink_to(
+            other_workspace,
+            target_is_directory=True,
+        )
+
+        # CodeView must reject the redirected workspace.
+        with self.assertRaises(SandboxWorkspaceError):
+            resolve_workspace(self.identity)
+
 if __name__ == "__main__":
     unittest.main()
