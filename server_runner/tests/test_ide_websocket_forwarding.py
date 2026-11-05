@@ -147,8 +147,7 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
 
         # Save the connection mock so we can inspect its calls.
         self.mock_connection = self.connection_patch.start()
-
-        # 7. Create the browser test client.
+        
         self.client = TestClient(self.app)
 
         # 8. Attach the valid IDE session cookie.
@@ -161,10 +160,8 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
     def tearDown(self):
         """Remove test resources."""
 
-        # Close the browser test client.
         self.client.close()
 
-        # Revoke the session created for this test.
         ide_session_store.revoke_session(
             self.session_token
         )
@@ -192,6 +189,8 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
                 response,
                 "IDE received: Hello VS Code",
             )
+            # Explicitly notify the proxy that the browser is closing.
+            websocket.close(code=1000)
 
         # Verify that the IDE received the original message.
         self.assertIn(
@@ -218,6 +217,9 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
                 b"IDE received binary",
             )
 
+            # Explicitly close the browser WebSocket.
+            websocket.close(code=1000)
+
         # Verify that the IDE received the binary data.
         self.assertIn(
             b"binary-data",
@@ -241,6 +243,8 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
                 response,
                 "IDE received: test",
             )
+            # Explicitly close the browser WebSocket.
+            websocket.close(code=1000)
 
         # Verify that the Unix socket connection was called.
         self.mock_connection.assert_called_once()

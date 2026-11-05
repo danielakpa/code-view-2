@@ -189,28 +189,68 @@ class TestIDEWebSocketCleanup(unittest.TestCase):
     def test_browser_disconnect_closes_ide(self):
         """Browser disconnection must close the IDE connection."""
 
-        # Establish the WebSocket connection.
-        with self.client.websocket_connect(
-            "/test-ide/editor"
-        ) as websocket:
+        import threading
 
-            # Verify that the connection works.
-            websocket.send_text("Hello CodeView")
+        # Track when the fake IDE finishes closing.
+        cleanup_complete = threading.Event()
 
-            response = websocket.receive_text()
+        # Save the original fake connection exit method.
+        original_exit = FakeIDEConnection.__aexit__
 
-            self.assertEqual(
-                response,
-                "IDE received: Hello CodeView",
-            )
+        async def track_connection_close(
+            connection,
+            exc_type,
+            exc_value,
+            traceback,
+        ):
+            """Record when IDE connection cleanup finishes."""
 
-        # The browser has disconnected.
-        # The IDE connection should now be closed.
+            try:
+                await original_exit(
+                    connection,
+                    exc_type,
+                    exc_value,
+                    traceback,
+                )
+            finally:
+                cleanup_complete.set()
+
+        # Monitor cleanup without changing production code.
+        with patch.object(
+            FakeIDEConnection,
+            "__aexit__",
+            track_connection_close,
+        ):
+
+            with self.client.websocket_connect(
+                "/test-ide/editor"
+            ) as websocket:
+
+                # Confirm that forwarding works.
+                websocket.send_text("Hello CodeView")
+
+                response = websocket.receive_text()
+
+                self.assertEqual(
+                    response,
+                    "IDE received: Hello CodeView",
+                )
+
+                # Send a normal browser disconnect.
+                websocket.close(code=1000)
+
+                # Wait until the fake IDE connection is released.
+                self.assertTrue(
+                    cleanup_complete.wait(timeout=2),
+                    "IDE connection cleanup did not finish.",
+                )
+
+        # The IDE connection must be closed.
         self.assertTrue(
             self.fake_ide.closed
         )
 
-        # The receiving task should have been cancelled.
+        # The IDE receiving task must have been cancelled.
         self.assertTrue(
             self.fake_ide.receive_cancelled
         )

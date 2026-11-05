@@ -210,9 +210,10 @@ class TestIDEWebSocketSession(unittest.TestCase):
                 "IDE received: Before disconnect",
             )
 
-        # The browser connection has now been closed.
+            # Explicitly tell the Gateway that the browser is closing.
+            websocket.close(code=1000)
 
-        # Verify that the IDE received the message.
+        # Verify that the IDE received the original message.
         self.assertIn(
             "Before disconnect",
             self.fake_ide.received_messages,
