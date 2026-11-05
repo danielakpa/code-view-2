@@ -36,7 +36,9 @@ class TestIDEHTTPOrigin(unittest.TestCase):
         # Create a test sandbox and browser session.
         self.sandbox_id = uuid4()
         self.session_token = ide_session_store.create_session(
-            self.sandbox_id
+            developer_id=12,
+            group_id=5,
+            sandbox_id=self.sandbox_id,
         )
 
         # Create an authenticated test client.

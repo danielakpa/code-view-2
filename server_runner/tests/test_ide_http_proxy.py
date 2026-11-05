@@ -29,7 +29,9 @@ class TestIDEHTTPProxy(unittest.TestCase):
 
         # Create a valid browser session.
         self.session_token = ide_session_store.create_session(
-            self.sandbox_id
+            developer_id=12,
+            group_id=5,
+            sandbox_id=self.sandbox_id,
         )
 
         # Configure the test client's browser cookie.

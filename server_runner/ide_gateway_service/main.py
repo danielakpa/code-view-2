@@ -96,7 +96,6 @@ async def internal_status(
         "authenticated": True,
     }
 
-
 # STEP 6: Verify the grant and create a handoff ticket.
 @app.post(
     "/internal/ide/authorize",
@@ -112,9 +111,9 @@ async def authorize_ide(
     This endpoint is called by Django, not the browser.
     """
 
-    # Ask the Runner to verify and consume the grant.
+    # STEP 1: Ask the Runner to verify and consume the grant.
     try:
-        sandbox_id = await consume_grant_with_runner(
+        identity = await consume_grant_with_runner(
             request.grant
         )
 
@@ -130,20 +129,19 @@ async def authorize_ide(
             detail="IDE authorization service unavailable.",
         ) from error
 
-    # Create a short-lived, one-time handoff ticket.
+    # STEP 2: Create a one-time ticket containing the verified identity.
     ticket = ide_handoff_store.create_ticket(
-        sandbox_id
+        identity
     )
 
-    # Prevent caching of the sensitive response.
+    # STEP 3: Return the authorized sandbox and handoff ticket.
     response = IDEAuthorizationResponse(
         authorized=True,
-        sandbox_id=sandbox_id,
+        sandbox_id=identity.sandbox_id,
         handoff_ticket=ticket,
     )
 
     return response
-
 
 # STEP 7: Exchange a handoff ticket for a browser session.
 @app.get("/ide/handoff/{ticket}")
@@ -154,30 +152,31 @@ async def complete_ide_handoff(ticket: str):
     The ticket can be used only once.
     """
 
-    # Consume the ticket.
-    sandbox_id = ide_handoff_store.consume_ticket(
+    # STEP 1: Consume the one-time handoff ticket.
+    handoff = ide_handoff_store.consume_ticket(
         ticket
     )
 
-    # Reject invalid, expired, or reused tickets.
-    if sandbox_id is None:
+    # STEP 2: Reject invalid, expired, or reused tickets.
+    if handoff is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid or expired IDE handoff ticket.",
         )
-
-    # Create a browser session.
+    # STEP 3: Create a browser session using the verified identities.
     session_token = ide_session_store.create_session(
-        sandbox_id
+        developer_id=handoff.developer_id,
+        group_id=handoff.group_id,
+        sandbox_id=handoff.sandbox_id,
     )
 
-    # Redirect the browser to the IDE entry point.
+    # STEP 4: Redirect the browser to the IDE entry point.
     response = RedirectResponse(
         url="/ide/",
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
-    # Store the session token in a secure cookie.
+    # STEP 5: Store the session token in a secure cookie.
     response.set_cookie(
         key="codeview_ide_session",
         value=session_token,
@@ -188,13 +187,15 @@ async def complete_ide_handoff(ticket: str):
         path="/ide",
     )
 
-    # Prevent caching of the redirect response.
+    # STEP 6: Prevent caching of the redirect response.
     response.headers["Cache-Control"] = "no-store"
 
-    # Avoid leaking the handoff URL to other websites.
+    # STEP 7: Avoid leaking the handoff URL to other websites.
     response.headers["Referrer-Policy"] = "no-referrer"
 
     return response
+
+
 # STEP 12: Verify the developer's IDE browser session.
 def get_authorized_ide_sandbox(
     codeview_ide_session: str | None = Cookie(default=None),

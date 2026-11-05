@@ -1,5 +1,6 @@
 """Internal Runner API client for the CodeView IDE Gateway."""
 
+from dataclasses import dataclass
 from uuid import UUID
 
 import httpx
@@ -7,6 +8,18 @@ import httpx
 from server_runner.ide_gateway_service.config import (
     get_gateway_settings,
 )
+
+
+@dataclass(frozen=True)
+class VerifiedIDEIdentity:
+    """
+    Store the developer, group, and sandbox identities
+    verified by the Runner.
+    """
+
+    developer_id: int
+    group_id: int
+    sandbox_id: UUID
 
 
 class RunnerAuthorizationError(Exception):
@@ -17,7 +30,9 @@ class RunnerUnavailableError(Exception):
     """Raised when the Runner service cannot be reached."""
 
 
-async def consume_grant_with_runner(grant: str) -> UUID:
+async def consume_grant_with_runner(
+    grant: str,
+) -> VerifiedIDEIdentity:
     """
     Send an IDE authorization grant to the Runner.
 
@@ -27,7 +42,7 @@ async def consume_grant_with_runner(grant: str) -> UUID:
     3. Sandbox ownership.
     4. Whether the grant has already been used.
 
-    Returns the verified sandbox UUID.
+    Return the verified developer, group, and sandbox identities.
     """
 
     # STEP 1: Validate the supplied grant.
@@ -78,9 +93,29 @@ async def consume_grant_with_runner(grant: str) -> UUID:
     try:
         data = response.json()
 
+        # Confirm the Runner authorized access.
+        if not isinstance(data, dict):
+            raise ValueError("Invalid Runner response.")
+
         if data.get("authorized") is not True:
             raise ValueError("Runner did not authorize access.")
 
+        # Extract the verified developer and group identities.
+        developer_id = data["developer_id"]
+        group_id = data["group_id"]
+
+        # Reject invalid IDs, including boolean values.
+        if (
+            type(developer_id) is not int
+            or developer_id <= 0
+            or type(group_id) is not int
+            or group_id <= 0
+        ):
+            raise ValueError(
+                "Invalid developer or group identity."
+            )
+
+        # Extract and validate the sandbox UUID.
         sandbox_id = UUID(data["sandbox_id"])
 
         if sandbox_id.int == 0:
@@ -91,5 +126,9 @@ async def consume_grant_with_runner(grant: str) -> UUID:
             "Runner returned invalid authorization data."
         ) from error
 
-    # STEP 8: Return the verified sandbox identity.
-    return sandbox_id
+    # STEP 8: Return all three verified identities.
+    return VerifiedIDEIdentity(
+        developer_id=developer_id,
+        group_id=group_id,
+        sandbox_id=sandbox_id,
+    )

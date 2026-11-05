@@ -90,7 +90,9 @@ class TestIDEWebSocketForwarding(unittest.TestCase):
 
         # 2. Create a valid session for this sandbox.
         self.session_token = ide_session_store.create_session(
-            self.sandbox_id
+            developer_id=12,
+            group_id=5,
+            sandbox_id=self.sandbox_id,
         )
 
         # 3. Create a fake IDE.

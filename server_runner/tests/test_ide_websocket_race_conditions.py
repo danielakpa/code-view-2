@@ -87,7 +87,9 @@ class TestIDEWebSocketRaceConditions(unittest.TestCase):
 
         # Create a valid session.
         self.session_token = ide_session_store.create_session(
-            self.sandbox_id
+            developer_id=12,
+            group_id=5,
+            sandbox_id=self.sandbox_id,
         )
 
         # Create the fake IDE.

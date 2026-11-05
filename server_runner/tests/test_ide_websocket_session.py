@@ -83,7 +83,9 @@ class TestIDEWebSocketSession(unittest.TestCase):
 
         # Create an authenticated IDE session.
         self.session_token = ide_session_store.create_session(
-            self.sandbox_id
+            developer_id=12,
+            group_id=5,
+            sandbox_id=self.sandbox_id,
         )
 
         # Create a simulated IDE.
