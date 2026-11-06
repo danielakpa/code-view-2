@@ -1,4 +1,4 @@
-"""Tests for CodeView IDE HTTP proxy routing."""
+"""Tests for CodeView IDE HTTP proxy routing and membership security."""
 
 import os
 import unittest
@@ -10,28 +10,32 @@ from fastapi.responses import Response
 from fastapi.testclient import TestClient
 
 from server_runner.ide_gateway_service.main import app
+
+from server_runner.ide_gateway_service.membership_client import (
+    MembershipAuthorizationError,
+    MembershipServiceUnavailableError,
+)
+
 from server_runner.ide_gateway_service.sessions import (
     ide_session_store,
 )
 
 
 class TestIDEHTTPProxy(unittest.TestCase):
-    """Test authenticated IDE HTTP routing."""
+    """Test authenticated IDE HTTP routing and membership revocation."""
 
     def setUp(self):
-        """Prepare an isolated browser session."""
+        """Prepare an isolated developer session."""
 
         # STEP 1: Define the developer and group identities.
         self.developer_id = 12
         self.group_id = 5
 
-        # STEP 2: Generate a unique sandbox identity.
+        # STEP 2: Generate unique sandbox and membership identities.
         self.sandbox_id = uuid4()
-
-        # STEP 3: Generate the developer's membership generation.
         self.membership_generation = uuid4()
 
-        # STEP 4: Configure the trusted IDE Origin.
+        # STEP 3: Configure the trusted browser origin.
         self.origin = "http://127.0.0.1:8002"
 
         self.origin_patch = patch.dict(
@@ -41,11 +45,22 @@ class TestIDEHTTPProxy(unittest.TestCase):
             },
         )
 
-        # Activate the test environment configuration.
         self.origin_patch.start()
 
-        # STEP 5: Create a valid browser session.
-        # The session must preserve all four identity values.
+        # STEP 4: Mock Django's membership-validation client.
+        # This prevents tests from making real network requests.
+        self.membership_patch = patch(
+            "server_runner.ide_gateway_service.main."
+            "validate_ide_membership",
+            new_callable=AsyncMock,
+        )
+
+        self.mock_membership = self.membership_patch.start()
+
+        # By default, Django confirms valid membership.
+        self.mock_membership.return_value = True
+
+        # STEP 5: Create a browser IDE session.
         self.session_token = ide_session_store.create_session(
             developer_id=self.developer_id,
             group_id=self.group_id,
@@ -53,10 +68,10 @@ class TestIDEHTTPProxy(unittest.TestCase):
             membership_generation=self.membership_generation,
         )
 
-        # STEP 6: Create the browser test client.
+        # STEP 6: Create the FastAPI test client.
         self.client = TestClient(app)
 
-        # STEP 7: Attach the session cookie.
+        # STEP 7: Attach the developer's session cookie.
         self.client.cookies.set(
             "codeview_ide_session",
             self.session_token,
@@ -64,17 +79,20 @@ class TestIDEHTTPProxy(unittest.TestCase):
         )
 
     def tearDown(self):
-        """Remove the test session and restore the environment."""
+        """Clean up the test session and patches."""
 
-        # STEP 1: Revoke the browser session.
+        # Revoke the test session.
         ide_session_store.revoke_session(
             self.session_token
         )
 
-        # STEP 2: Close the browser test client.
+        # Close the test client.
         self.client.close()
 
-        # STEP 3: Restore the original environment.
+        # Restore the real membership validator.
+        self.membership_patch.stop()
+
+        # Restore environment variables.
         self.origin_patch.stop()
 
     @patch(
@@ -82,7 +100,7 @@ class TestIDEHTTPProxy(unittest.TestCase):
         new_callable=AsyncMock,
     )
     def test_valid_session_reaches_proxy(self, mock_proxy):
-        """An authorized request should reach the HTTP proxy."""
+        """A valid session and membership should reach the IDE."""
 
         mock_proxy.return_value = Response(
             content="IDE ready",
@@ -94,13 +112,19 @@ class TestIDEHTTPProxy(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.text, "IDE ready")
 
-        # Confirm the correct sandbox was selected.
+        # Confirm the Gateway selected the correct sandbox.
         self.assertEqual(
             mock_proxy.call_args.kwargs["sandbox_id"],
             self.sandbox_id,
         )
 
-        # Confirm the proxy was called once.
+        # Confirm Django checked the developer's membership.
+        self.mock_membership.assert_awaited_once_with(
+            developer_id=self.developer_id,
+            group_id=self.group_id,
+            membership_generation=self.membership_generation,
+        )
+
         mock_proxy.assert_awaited_once()
 
     @patch(
@@ -121,27 +145,29 @@ class TestIDEHTTPProxy(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
-        # Confirm the nested resource path was forwarded.
         self.assertEqual(
             mock_proxy.call_args.kwargs["path"],
             "static/app.js",
         )
+
+        self.mock_membership.assert_awaited_once()
 
     @patch(
         "server_runner.ide_gateway_service.main.proxy_ide_http",
         new_callable=AsyncMock,
     )
     def test_missing_session_rejected(self, mock_proxy):
-        """Requests without a session must be rejected."""
+        """Requests without a browser session must be rejected."""
 
-        # Remove the browser cookie.
         self.client.cookies.clear()
 
         response = self.client.get("/ide/")
 
         self.assertEqual(response.status_code, 401)
 
-        # The unauthorized request must not reach the IDE.
+        # No membership lookup is needed without a valid session.
+        self.mock_membership.assert_not_awaited()
+
         mock_proxy.assert_not_awaited()
 
     @patch(
@@ -149,12 +175,10 @@ class TestIDEHTTPProxy(unittest.TestCase):
         new_callable=AsyncMock,
     )
     def test_invalid_session_rejected(self, mock_proxy):
-        """Invalid sessions must not reach the proxy."""
+        """Invalid browser sessions must not reach the IDE."""
 
-        # Remove the existing session cookie.
         self.client.cookies.clear()
 
-        # Replace it with an invalid session token.
         self.client.cookies.set(
             "codeview_ide_session",
             "invalid-token",
@@ -165,7 +189,8 @@ class TestIDEHTTPProxy(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
 
-        # The invalid session must not reach the IDE.
+        self.mock_membership.assert_not_awaited()
+
         mock_proxy.assert_not_awaited()
 
     @patch(
@@ -176,9 +201,8 @@ class TestIDEHTTPProxy(unittest.TestCase):
         self,
         mock_proxy,
     ):
-        """A browser must not choose another sandbox."""
+        """A browser cannot choose another developer's sandbox."""
 
-        # Generate a sandbox belonging to another developer.
         other_sandbox = uuid4()
 
         mock_proxy.return_value = Response(
@@ -186,34 +210,33 @@ class TestIDEHTTPProxy(unittest.TestCase):
             status_code=200,
         )
 
-        # Attempt to supply another sandbox ID.
+        # Attempt to override the sandbox through a query parameter.
         response = self.client.get(
             f"/ide/?sandbox_id={other_sandbox}"
         )
 
         self.assertEqual(response.status_code, 200)
 
-        # The Gateway must ignore the supplied sandbox ID.
-        # It must use the sandbox stored in the session.
+        # The Gateway must use the sandbox stored in the session.
         self.assertEqual(
             mock_proxy.call_args.kwargs["sandbox_id"],
             self.sandbox_id,
         )
+
+        self.mock_membership.assert_awaited_once()
 
     @patch(
         "server_runner.ide_gateway_service.main.proxy_ide_http",
         new_callable=AsyncMock,
     )
     def test_post_request_forwarded(self, mock_proxy):
-        """POST requests should reach the authorized proxy."""
+        """Authorized POST requests should reach the IDE."""
 
-        # Simulate a successful response from the IDE.
         mock_proxy.return_value = Response(
             content="Saved",
             status_code=200,
         )
 
-        # Send a POST request with a trusted Origin.
         response = self.client.post(
             "/ide/api/save",
             content=b"test-data",
@@ -222,14 +245,133 @@ class TestIDEHTTPProxy(unittest.TestCase):
             },
         )
 
-        # Verify that the request was successful.
         self.assertEqual(response.status_code, 200)
 
-        # Verify that the correct IDE path was forwarded.
         self.assertEqual(
             mock_proxy.call_args.kwargs["path"],
             "api/save",
         )
+
+        self.mock_membership.assert_awaited_once()
+
+    @patch(
+        "server_runner.ide_gateway_service.main.proxy_ide_http",
+        new_callable=AsyncMock,
+    )
+    def test_removed_member_rejected(self, mock_proxy):
+        """Removed developers must lose IDE HTTP access."""
+
+        # Simulate Django reporting that membership was removed.
+        self.mock_membership.side_effect = (
+            MembershipAuthorizationError(
+                "Developer is no longer a group member."
+            )
+        )
+
+        response = self.client.get("/ide/")
+
+        # The Gateway must reject the developer.
+        self.assertEqual(response.status_code, 403)
+
+        # No request may reach the IDE.
+        mock_proxy.assert_not_awaited()
+
+        # The revoked session must no longer exist.
+        self.assertIsNone(
+            ide_session_store.get_session(
+                self.session_token
+            )
+        )
+
+    @patch(
+        "server_runner.ide_gateway_service.main.proxy_ide_http",
+        new_callable=AsyncMock,
+    )
+    def test_revoked_session_cannot_be_reused(self, mock_proxy):
+        """A revoked browser session cannot regain access."""
+
+        # First request: Django reports removed membership.
+        self.mock_membership.side_effect = (
+            MembershipAuthorizationError(
+                "Membership revoked."
+            )
+        )
+
+        first_response = self.client.get("/ide/")
+
+        self.assertEqual(first_response.status_code, 403)
+
+        # Simulate Django becoming available again.
+        self.mock_membership.side_effect = None
+        self.mock_membership.return_value = True
+
+        # Second request: the original session is already revoked.
+        second_response = self.client.get("/ide/")
+
+        self.assertEqual(second_response.status_code, 401)
+
+        # Neither request may reach the IDE.
+        mock_proxy.assert_not_awaited()
+
+        # Only the first request should contact Django.
+        self.mock_membership.assert_awaited_once()
+
+    @patch(
+        "server_runner.ide_gateway_service.main.proxy_ide_http",
+        new_callable=AsyncMock,
+    )
+    def test_django_unavailable_rejected(self, mock_proxy):
+        """Django outages must not grant IDE access."""
+
+        # Simulate a Django service outage.
+        self.mock_membership.side_effect = (
+            MembershipServiceUnavailableError(
+                "Django membership service unavailable."
+            )
+        )
+
+        response = self.client.get("/ide/")
+
+        # Fail closed when membership cannot be verified.
+        self.assertEqual(response.status_code, 503)
+
+        # The IDE must not receive the request.
+        mock_proxy.assert_not_awaited()
+
+        # A temporary outage should not automatically revoke
+        # an otherwise valid session.
+        self.assertIsNotNone(
+            ide_session_store.get_session(
+                self.session_token
+            )
+        )
+
+    @patch(
+        "server_runner.ide_gateway_service.main.proxy_ide_http",
+        new_callable=AsyncMock,
+    )
+    def test_old_membership_generation_rejected(self, mock_proxy):
+        """Sessions from previous group memberships must be denied."""
+
+        # Django rejects the generation stored in the old session.
+        self.mock_membership.side_effect = (
+            MembershipAuthorizationError(
+                "Membership generation no longer matches."
+            )
+        )
+
+        response = self.client.get("/ide/")
+
+        self.assertEqual(response.status_code, 403)
+
+        # The old session must be revoked.
+        self.assertIsNone(
+            ide_session_store.get_session(
+                self.session_token
+            )
+        )
+
+        mock_proxy.assert_not_awaited()
 
 
 if __name__ == "__main__":

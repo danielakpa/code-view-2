@@ -77,40 +77,53 @@ def authorize_developer_ide_access(user, group, developer_id):
 
     # STEP 3: Authorization succeeded.
     return True
-
 def get_developer_ide_membership_generation(user, group):
     """
-    Return the current membership generation for IDE authorization.
+    Return the developer's current membership generation.
 
-    This allows CodeView to distinguish a developer's current
-    group membership from previous memberships.
+    Security rules:
+    1. The developer must be authorized.
+    2. Group owners use the group's persistent owner generation.
+    3. Regular members use their membership generation.
+    4. Unauthorized developers must be rejected.
     """
 
-    # STEP 1: Verify the developer can access the private group.
+    # STEP 1: Verify the developer has permission to access
+    # their own IDE inside this private development group.
     authorize_developer_ide_access(
         user=user,
         group=group,
         developer_id=user.pk,
     )
 
-    # STEP 2: Find the developer's current group membership.
+    # STEP 2: Check whether the developer owns the group.
+    #
+    # Owners may not have a GroupMember record.
+    # Their generation is stored directly on ProjectGroup.
+    if group.owner_id == user.pk:
+
+        # Return the persistent UUID stored in the database.
+        return group.owner_membership_generation
+
+    # STEP 3: Find the developer's approved membership.
     membership = GroupMember.objects.filter(
         group=group,
         user=user,
     ).first()
 
-    # STEP 3: Return the current membership generation.
-    if membership is not None:
-        return membership.membership_generation
-
-    # STEP 4: Group owners can be authorized without a
-    # GroupMember record. Do not invent a generation for them.
+    # STEP 4: Reject missing memberships.
     #
-    # Owner authorization needs a separate, persistent generation
-    # before we can safely issue generation-bound IDE sessions.
-    raise PermissionError(
-        "IDE membership generation is unavailable."
-    )
+    # This protects developers who have been removed.
+    if membership is None:
+        raise PermissionError(
+            "You are no longer a member of this development group."
+        )
+
+    # STEP 5: Return the current membership generation.
+    #
+    # If the developer leaves and rejoins, a new GroupMember
+    # record should receive a new UUID.
+    return membership.membership_generation
 
 def authorize_code_board_execution(user, board_id):
     """

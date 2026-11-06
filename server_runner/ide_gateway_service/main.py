@@ -45,6 +45,12 @@ from server_runner.ide_gateway_service.handoff import (
     ide_handoff_store,
 )
 
+from server_runner.ide_gateway_service.membership_client import (
+    MembershipAuthorizationError,
+    MembershipServiceUnavailableError,
+    validate_ide_membership,
+)
+
 
 # STEP 1: Create the FastAPI application.
 app = FastAPI(
@@ -197,36 +203,58 @@ async def complete_ide_handoff(ticket: str):
     return response
 
 
-# STEP 12: Verify the developer's IDE browser session.
-def get_authorized_ide_sandbox(
+# STEP 12: Verify both the browser session and current group membership.
+async def get_authorized_ide_sandbox(
     codeview_ide_session: str | None = Cookie(default=None),
-):
-    """
-    Find the sandbox belonging to an authorized IDE session.
+) -> UUID:
+    """Return the sandbox only after Django confirms current membership."""
 
-    This dependency will be reused by our HTTP routes.
-    """
-
-    # STEP 1: Reject requests without a session cookie.
+    # A browser must supply the opaque IDE session cookie.
     if not codeview_ide_session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="IDE session is missing.",
         )
 
-    # STEP 2: Look up the browser session.
-    session = ide_session_store.get_session(
-        codeview_ide_session
-    )
-
-    # STEP 3: Reject invalid or expired sessions.
+    # The browser cannot choose its developer, group, or sandbox identity.
+    session = ide_session_store.get_session(codeview_ide_session)
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="IDE session is invalid or expired.",
         )
 
-    # STEP 4: Return the authorized sandbox identity.
+    # Ask Django to compare the session's membership generation with
+    # the authoritative value in PostgreSQL on EVERY HTTP request.
+    try:
+        await validate_ide_membership(
+            developer_id=session.developer_id,
+            group_id=session.group_id,
+            membership_generation=session.membership_generation,
+        )
+    except MembershipAuthorizationError as error:
+        # A removed member or stale generation must lose this session.
+        ide_session_store.revoke_session(codeview_ide_session)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="IDE group membership is no longer authorized.",
+        ) from error
+    except MembershipServiceUnavailableError as error:
+        # Fail closed: do not proxy traffic when Django cannot verify access.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="IDE membership validation is unavailable.",
+        ) from error
+
+    # Recheck the local token: it might have been revoked while awaiting
+    # the Django HTTP request. Do not use the old session object blindly.
+    current_session = ide_session_store.get_session(codeview_ide_session)
+    if current_session is None or current_session != session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="IDE session was revoked during authorization.",
+        )
+
     return session.sandbox_id
 
 

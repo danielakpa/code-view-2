@@ -25,12 +25,23 @@ class ProjectGroup(models.Model):
     name = models.CharField(max_length=100)
 
     description = models.TextField()
-
-    # Developer who created the group.
+    # Developer who owns the group.
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="owned_project_groups",
+    )
+
+    # Give the group owner's IDE authorization a persistent UUID.
+    #
+    # This is separate from regular GroupMember generations
+    # because owners may not have a GroupMember record.
+    #
+    # If ownership changes, this UUID must also change
+    # to invalidate the previous owner's IDE sessions.
+    owner_membership_generation = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
     )
 
     # False = Public Community.

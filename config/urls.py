@@ -1,4 +1,5 @@
 """Main URL configuration for CodeView."""
+
 # Access Django project settings.
 from django.conf import settings
 
@@ -11,8 +12,13 @@ from django.views.generic import RedirectView
 
 from home.views import home
 
+# Import the internal IDE membership validation endpoint.
+from server_runner.ide_membership_api import (
+    validate_ide_membership,
+)
 
-# Django looks for this exact variable name: urlpatterns
+
+# Django looks for this exact variable name: urlpatterns.
 urlpatterns = [
 
     # Django admin panel.
@@ -36,9 +42,23 @@ urlpatterns = [
         ),
     ),
 
-
-]
     # ========================================
+    # INTERNAL IDE MEMBERSHIP VALIDATION
+    # ========================================
+
+    # Used by the trusted IDE Gateway.
+    #
+    # Currently rejects every request.
+    # Authentication and database validation come next.
+    path(
+        "internal/ide/membership/validate/",
+        validate_ide_membership,
+        name="internal_ide_membership_validate",
+    ),
+]
+
+
+# ========================================
 # SERVE UPLOADED FILES DURING DEVELOPMENT
 # ========================================
 
