@@ -5,55 +5,75 @@ Handles:
 1. HTTP requests using Django.
 2. WebSocket connections using Django Channels.
 3. Authentication for WebSocket connections.
+4. Static files during local development.
 """
 
 import os
 
+from django.conf import settings
 from django.core.asgi import get_asgi_application
+from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler
 
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.auth import AuthMiddlewareStack
 
 
-# ==========================================
+# ============================================================
 # 1. CONFIGURE DJANGO SETTINGS
-# ==========================================
+# ============================================================
 
-# Tell Django which settings file to use.
 os.environ.setdefault(
     "DJANGO_SETTINGS_MODULE",
     "config.settings"
 )
 
 
-# ==========================================
+# ============================================================
 # 2. INITIALIZE DJANGO
-# ==========================================
+# ============================================================
 
-# Initialize Django before importing WebSocket routes
-# that may use Django models.
+# Create the Django ASGI application.
 django_asgi_app = get_asgi_application()
 
 
-# ==========================================
-# 3. IMPORT WEBSOCKET ROUTES
-# ==========================================
+# ============================================================
+# 3. ENABLE STATIC FILES IN DEVELOPMENT
+# ============================================================
 
-# This file will contain our Group Chat WebSocket URLs.
-# We will create it in the next step.
+# Daphne does not automatically serve Django static files.
+#
+# During development, this handler serves:
+# - CSS files
+# - JavaScript files
+# - Images
+#
+# In production, a reverse proxy or static-file server
+# should serve these files instead.
+
+if settings.DEBUG:
+
+    django_asgi_app = ASGIStaticFilesHandler(
+        django_asgi_app
+    )
+
+
+# ============================================================
+# 4. IMPORT WEBSOCKET ROUTES
+# ============================================================
+
 from community.routing import websocket_urlpatterns
 
 
-# ==========================================
-# 4. CONFIGURE ASGI APPLICATION
-# ==========================================
+# ============================================================
+# 5. CONFIGURE ASGI APPLICATION
+# ============================================================
 
 application = ProtocolTypeRouter({
 
-    # Handle normal website requests.
+    # Handle HTTP requests.
     "http": django_asgi_app,
 
-    # Handle real-time WebSocket connections.
+    # Handle WebSocket connections.
     "websocket": AuthMiddlewareStack(
 
         URLRouter(

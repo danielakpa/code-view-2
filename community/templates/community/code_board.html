@@ -15,9 +15,10 @@
         content="width=device-width, initial-scale=1.0"
     >
 
-    <title>
-        Code Board | {{ group.name }} | CodeView
-    </title>
+    <!-- Do not send the handoff URL as a referrer. -->
+    <meta name="referrer" content="no-referrer">
+
+    <title>Code Board | {{ group.name }} | CodeView</title>
 
     <!-- Shared CodeView styles. -->
     <link
@@ -25,16 +26,10 @@
         href="{% static 'community/sheared.css' %}"
     >
 
-    <!-- Existing Code Board styles. -->
+    <!-- Code Board styles. -->
     <link
         rel="stylesheet"
         href="{% static 'community/code_board/code_board.css' %}"
-    >
-
-    <!-- Xterm.js terminal styles. -->
-    <link
-        rel="stylesheet"
-        href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
     >
 
 </head>
@@ -65,7 +60,7 @@
 
         </nav>
 
-        <!-- Logged-in developer profile. -->
+        <!-- Logged-in developer. -->
         <div class="profile">
 
             <span class="avatar">
@@ -86,7 +81,7 @@
 
     <main class="code-board-container">
 
-        <!-- Return to the group's meeting room. -->
+        <!-- Return to the meeting room. -->
         <a
             href="{% url 'meeting_room' group.id %}"
             class="back-link"
@@ -100,27 +95,27 @@
 
         <section class="code-board-header">
 
-            <div>
+            <div class="code-board-heading">
 
-                <h1>
-                    Code Board
-                </h1>
+                <h1>Code Board</h1>
 
-                <p>
-                    {{ group.name }} — Developer Workspace
+                <p class="group-name">
+                    {{ group.name }} — Private Developer Workspace
                 </p>
 
-                <p>
-                    Write and run code directly from your browser.
+                <p class="code-board-description">
+                    Write, edit, debug, and run code using VS Code.
                 </p>
 
             </div>
 
-            <!-- Browser storage status. -->
-            <div class="last-editor">
+            <!-- Workspace status. -->
+            <div class="workspace-status">
 
-                <span id="workspace-status" role="status">
-                    Loading workspace...
+                <span class="status-indicator"></span>
+
+                <span>
+                    Private Workspace
                 </span>
 
             </div>
@@ -135,69 +130,90 @@
 
             {% if repository %}
 
-                <h2>
-                    Connected GitHub Repository
-                </h2>
+                <div class="repository-header">
 
-                <p>
-                    Repository:
+                    <h2>
+                        Connected GitHub Repository
+                    </h2>
 
-                    <strong>
-                        {{ repository.github_owner }}/{{ repository.repository_name }}
-                    </strong>
-                </p>
+                    <span class="repository-badge">
+                        GitHub
+                    </span>
 
-                <p>
-                    Default Branch:
+                </div>
 
-                    <strong>
-                        {{ repository.default_branch }}
-                    </strong>
-                </p>
+                <div class="repository-details">
 
-                <!-- GitHub branch selector. -->
+                    <p>
+                        Repository:
+
+                        <strong>
+                            {{ repository.github_owner }}/{{ repository.repository_name }}
+                        </strong>
+                    </p>
+
+                    <p>
+                        Default Branch:
+
+                        <strong>
+                            {{ repository.default_branch }}
+                        </strong>
+                    </p>
+
+                </div>
+
+                <!-- GitHub branch information. -->
                 <div class="branch-selector">
 
-                    <label for="github-branch">
-                        Select Your Branch
-                    </label>
+                    <div class="branch-field">
 
-                    <select
-                        id="github-branch"
-                        name="github_branch"
-                    >
+                        <label for="github-branch">
+                            Available Branches
+                        </label>
 
-                        {% for branch in branches %}
+                        <select
+                            id="github-branch"
+                            name="github_branch"
+                        >
 
-                            <option
-                                value="{{ branch }}"
-                                {% if branch == repository.default_branch %}selected{% endif %}
-                            >
-                                {{ branch }}
-                            </option>
+                            {% for branch in branches %}
 
-                        {% endfor %}
+                                <option
+                                    value="{{ branch }}"
+                                    {% if branch == repository.default_branch %}selected{% endif %}
+                                >
+                                    {{ branch }}
+                                </option>
 
-                    </select>
+                            {% endfor %}
 
-                    <!-- Existing GitHub branch button. -->
+                        </select>
+
+                    </div>
+
+                    <!-- Branch creation is not implemented yet. -->
                     <button
                         type="button"
                         class="create-branch-btn"
-                        id="create-branch-btn"
                         disabled
-                        title="GitHub authorization is required before creating branches"
+                        title="Use the VS Code terminal to create branches"
                     >
                         + New Branch
                     </button>
 
                 </div>
 
+                <p class="repository-note">
+                    Branch selection above displays repository information.
+                    Use Git inside VS Code to switch branches.
+                </p>
+
             {% else %}
 
-                <p>
-                    No GitHub repository has been connected
-                    to this group.
+                <h2>GitHub Repository</h2>
+
+                <p class="no-repository">
+                    No GitHub repository has been connected to this group.
                 </p>
 
             {% endif %}
@@ -205,332 +221,140 @@
         </section>
 
         <!-- =================================================
-             6. DEVELOPER WORKSPACE
+             6. PRIVATE VS CODE WORKSPACE
         ================================================== -->
-
-        <!--
-            The group and developer IDs identify this browser
-            workspace.
-
-            JavaScript uses them to keep files separate.
-
-            These attributes do not grant permissions.
-            Django still checks permissions before execution.
-        -->
 
         <section
             id="codeview-workspace"
             class="codeview-workspace"
-            data-group-id="{{ group.id }}"
-            data-developer-id="{{ request.user.id }}"
         >
 
-            <!-- =============================================
-                 7. FILE EXPLORER
-            ============================================== -->
+            <!-- IDE toolbar. -->
+            <div class="ide-toolbar">
 
-            <aside class="workspace-sidebar">
+                <div class="ide-toolbar-left">
 
-                <div class="workspace-sidebar-header">
-
-                    <h2>
-                        Explorer
-                    </h2>
-
-                    <!-- Create a new browser-local file. -->
-                    <button
-                        type="button"
-                        id="new-file-btn"
-                        class="new-file-btn"
-                    >
-                        + New File
-                    </button>
-
-                </div>
-
-                <p class="workspace-description">
-                    Your files are automatically saved
-                    in this browser.
-                </p>
-
-                <!--
-                    workspace.js creates file buttons here.
-
-                    Example:
-
-                    main.py
-                    utils.py
-                    app.js
-                -->
-
-                <div
-                    id="workspace-file-list"
-                    class="workspace-file-list"
-                    aria-label="Workspace files"
-                ></div>
-
-            </aside>
-
-            <!-- =============================================
-                 8. CODE EDITOR
-            ============================================== -->
-
-            <section class="workspace-editor">
-
-                <!-- Editor toolbar. -->
-                <div class="editor-toolbar">
-
-                    <div class="toolbar-field">
-
-                        <label for="code-language">
-                            Language
-                        </label>
-
-                        <!--
-                            The selected language determines
-                            which runtime executes the code.
-                        -->
-
-                        <select
-                            id="code-language"
-                            name="language"
-                        >
-
-                            <option value="python">
-                                Python
-                            </option>
-
-                            <option value="go">
-                                Go
-                            </option>
-
-                            <option value="javascript">
-                                JavaScript
-                            </option>
-
-                        </select>
-
-                    </div>
-
-                </div>
-
-                <!-- =========================================
-                     9. SOURCE CODE EDITOR
-                ========================================== -->
-
-                <div class="editor-container">
-
-                    <!-- File information. -->
-                    <div class="editor-topbar">
-
-                        <span class="editor-filename">
-                            main.py
-                        </span>
-
-                        <span class="editor-language">
-                            python
-                        </span>
-
-                    </div>
-
-                    <!--
-                        The developer writes code here.
-
-                        workspace.js automatically saves changes
-                        to IndexedDB.
-
-                        run_code.js reads the current editor value
-                        and sends it to Django when Run is clicked.
-
-                        No Save Code form is needed.
-                    -->
-
-                    <textarea
-                        id="code-editor"
-                        name="code"
-                        class="code-editor"
-                        placeholder="Start writing your code here..."
-                        spellcheck="false"
-                        aria-label="Source code editor"
-                    ></textarea>
-
-                </div>
-
-                <!-- =========================================
-                     10. RUN CODE BUTTON
-                ========================================== -->
-
-                <div class="editor-actions">
-
-                    <span class="save-info">
-                        Changes are saved automatically
-                        in this browser.
+                    <span class="ide-icon">
+                        &lt;/&gt;
                     </span>
 
-                    <!--
-                        JavaScript sends a POST request to Django.
+                    <div>
 
-                        The URL is generated by Django rather than
-                        being hardcoded in JavaScript.
-                    -->
+                        <h2>
+                            VS Code
+                        </h2>
 
-                    <button
-                        type="button"
-                        id="run-code-btn"
-                        class="run-code-btn"
-                        data-run-url="{% url 'run_code_board' group.id %}"
-                    >
-                        ▶ Run Code
-                    </button>
+                        <p>
+                            Your Private Development Environment
+                        </p>
+
+                    </div>
 
                 </div>
 
-            </section>
+                <!-- This indicates the connection attempt, not readiness. -->
+                <div class="ide-connection-status">
+
+                    <span class="connection-indicator"></span>
+
+                    <span id="ide-status" role="status">
+                        Connecting to VS Code...
+                    </span>
+
+                </div>
+
+            </div>
+
+            <!-- =================================================
+                 7. REAL VS CODE EDITOR
+            ================================================== -->
+
+            <div class="ide-container">
+
+                <!--
+                    The iframe opens the authorized IDE Gateway.
+
+                    Django has already:
+                    1. Verified group membership.
+                    2. Started the developer's Docker IDE.
+                    3. Created a signed authorization grant.
+                    4. Obtained a one-time handoff ticket.
+
+                    The Gateway exchanges that ticket for a
+                    browser session and forwards IDE requests
+                    to the authorized Docker container.
+
+                    The browser does not select a sandbox ID.
+                -->
+
+                <iframe
+                    id="codeview-ide"
+                    class="codeview-ide-frame"
+                    title="CodeView VS Code Workspace"
+                    src="{{ ide_handoff_url }}"
+                    referrerpolicy="no-referrer"
+                    allow="clipboard-read; clipboard-write"
+                ></iframe>
+
+            </div>
 
         </section>
 
         <!-- =================================================
-             11. EXECUTION OUTPUT
+             8. WORKSPACE INFORMATION
         ================================================== -->
 
-        <section class="code-board-output">
+        <section class="workspace-information">
 
-            <div class="terminal-header">
+            <div class="information-card">
 
-                <h2>
-                    Execution Output
-                </h2>
+                <h3>
+                    Private Workspace
+                </h3>
 
-                <!-- JavaScript updates this status. -->
-                <span
-                    id="execution-status"
-                    class="terminal-status"
-                    role="status"
-                >
-                    Ready
-                </span>
+                <p>
+                    Your development environment is isolated
+                    from other developers' workspaces.
+                </p>
 
             </div>
 
-            <!--
-                Displays program output and errors.
+            <div class="information-card">
 
-                textContent is used by JavaScript so that
-                program output is treated as text, not HTML.
-            -->
+                <h3>
+                    Integrated Terminal
+                </h3>
 
-            <pre
-                id="execution-output"
-                class="execution-output"
-                aria-live="polite"
-            >Click Run Code to execute your program.</pre>
-
-        </section>
-
-        <!-- =================================================
-             12. PRIVATE DEVELOPER TERMINAL
-        ================================================== -->
-
-        <section class="code-board-terminal">
-
-            <div class="terminal-header">
-
-                <h2>
-                    Terminal
-                </h2>
-
-                <span
-                    class="terminal-status"
-                    id="terminal-status"
-                >
-                    Not connected
-                </span>
+                <p>
+                    Use the terminal inside VS Code to run
+                    Python, Go, JavaScript, and Git commands
+                    supported by your environment.
+                </p>
 
             </div>
 
-            <!--
-                Preserve the existing private terminal.
+            <div class="information-card">
 
-                terminal.js uses this element to initialize
-                the xterm.js terminal.
-            -->
+                <h3>
+                    Workspace Files
+                </h3>
 
-            <div
-                id="terminal-container"
-                class="terminal-container"
-                data-group-id="{{ group.id }}"
-                aria-label="Private developer terminal"
-            ></div>
+                <p>
+                    Work with files in your private development
+                    workspace instead of browser-local storage.
+                </p>
+
+            </div>
 
         </section>
 
     </main>
 
-    <!-- =====================================================
-         13. DJANGO CSRF TOKEN
-    ====================================================== -->
-
-    <!--
-        Django requires a CSRF token for POST requests.
-
-        The form is not submitted to save code.
-
-        run_code.js reads the hidden token and sends it
-        with the execution request.
-    -->
-
-    <form id="codeview-csrf-form" hidden>
-        {% csrf_token %}
-    </form>
-
-    <!-- =====================================================
-         14. JAVASCRIPT LIBRARIES
-    ====================================================== -->
-
-    <!-- Existing xterm.js terminal library. -->
-    <script
-        src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"
-    ></script>
-
-    <!-- =====================================================
-         15. CODEVIEW JAVASCRIPT
-    ====================================================== -->
-
-    <!--
-        Load IndexedDB first.
-
-        It provides the functions used by workspace.js.
-    -->
-
-    <script
-        src="{% static 'community/code_board/indexeddb.js' %}"
-    ></script>
-
-    <!--
-        Manage files and automatically save source code
-        in the developer's browser.
-    -->
-
-    <script
-        src="{% static 'community/code_board/workspace.js' %}"
-    ></script>
-
-    <!--
-        Execute code through Django and FastAPI.
-    -->
-
-    <script
-        src="{% static 'community/code_board/run_code.js' %}"
-    ></script>
-
-    <!--
-        Preserve the existing private terminal.
-    -->
-
-    <script
-        src="{% static 'community/code_board/terminal.js' %}"
-    ></script>
+    <!-- Code Board JavaScript -->
+<script
+    src="{% static 'community/code_board/code_board.js' %}"
+    defer
+></script>
 
 </body>
-
 </html>

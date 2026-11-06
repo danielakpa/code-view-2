@@ -4,6 +4,7 @@
 # ============================================================
 # 1. PYTHON BUILT-IN MODULES
 # ============================================================
+import logging
 
 # Convert a sandbox ID string into a validated UUID.
 from uuid import UUID
@@ -217,6 +218,9 @@ from .models import (
 # ============================================================
 # HELPER: CHECK GROUP MEMBERSHIP
 # ============================================================
+
+logger = logging.getLogger(__name__)
+
 def is_group_member(group, user):
     """Check whether a developer owns or belongs to a group."""
 
@@ -1421,9 +1425,15 @@ def code_board(request, group_id):
         KeyError,
         TypeError,
         RuntimeError,
-    ):
+        ) as error:
 
-        # Fail closed without exposing internal credentials.
+        # Log the error type without exposing sensitive credentials.
+        logger.error(
+            "Code Board IDE authorization failed: %s",
+            type(error).__name__,
+        )
+
+        # Return a safe error message to the browser.
         return HttpResponse(
             "CodeView could not authorize your development environment. "
             "Please try again.",
@@ -1534,7 +1544,7 @@ def code_board(request, group_id):
 
     return response
 
-    
+
 @login_required
 @require_POST
 def run_code_board(request, group_id):
