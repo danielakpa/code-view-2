@@ -11,6 +11,12 @@ from starlette.websockets import WebSocketState
 from websockets.asyncio.client import unix_connect
 from websockets.exceptions import ConnectionClosed
 
+from server_runner.ide_gateway_service.membership_client import (
+    MembershipAuthorizationError,
+    MembershipServiceUnavailableError,
+    validate_ide_membership,
+)
+
 from server_runner.ide_gateway_service.socket_connection import (
     get_ide_socket_path,
     validate_ide_socket,
@@ -21,10 +27,10 @@ from server_runner.ide_gateway_service.sessions import (
 )
 
 
-# Create a logger for WebSocket Gateway errors.
+# Logger for WebSocket Gateway errors.
 logger = logging.getLogger(__name__)
 
-# Check the developer's session every 5 seconds.
+# Recheck the developer's authorization every 5 seconds.
 SESSION_CHECK_INTERVAL = 5
 
 
@@ -52,9 +58,12 @@ async def proxy_ide_websocket(
     path: str = "",
     session_token: str | None = None,
 ) -> None:
-    """Forward IDE messages while checking session authorization."""
+    """Forward IDE messages while continuously validating authorization."""
 
-    # 1. Reject unsafe resource paths.
+    # ---------------------------------------------------------
+    # STEP 1: Reject unsafe resource paths.
+    # ---------------------------------------------------------
+
     if (
         path.startswith("/")
         or "\\" in path
@@ -63,19 +72,106 @@ async def proxy_ide_websocket(
         await close_websocket_safely(websocket, code=1008)
         return
 
-    # 2. Require an authenticated IDE session.
+    # ---------------------------------------------------------
+    # STEP 2: Require an authenticated IDE session.
+    # ---------------------------------------------------------
+
     if not session_token:
         await close_websocket_safely(websocket, code=1008)
         return
 
     session = ide_session_store.get_session(session_token)
 
-    # Reject sessions belonging to another sandbox.
+    # Reject missing sessions or sessions for another sandbox.
     if session is None or session.sandbox_id != sandbox_id:
         await close_websocket_safely(websocket, code=1008)
         return
 
-    # 3. Locate and validate the developer's Unix socket.
+    # ---------------------------------------------------------
+    # STEP 3: Validate membership with Django.
+    # ---------------------------------------------------------
+
+    async def check_membership() -> bool:
+        """Check local session identity and current Django membership."""
+
+        # Read the current session.
+        current_session = ide_session_store.get_session(
+            session_token
+        )
+
+        # Reject expired or revoked sessions.
+        if current_session is None:
+            return False
+
+        # Reject sessions belonging to another sandbox.
+        if current_session.sandbox_id != sandbox_id:
+            return False
+
+        # Reject sessions whose identity has changed.
+        if (
+            current_session.developer_id != session.developer_id
+            or current_session.group_id != session.group_id
+            or current_session.membership_generation
+            != session.membership_generation
+        ):
+            return False
+
+        # Ask Django whether this developer still has access.
+        try:
+            authorized = await validate_ide_membership(
+                developer_id=session.developer_id,
+                group_id=session.group_id,
+                membership_generation=session.membership_generation,
+            )
+
+        except MembershipAuthorizationError:
+            # Django confirmed that access is no longer valid.
+            ide_session_store.revoke_session(session_token)
+
+            return False
+
+        except MembershipServiceUnavailableError:
+            # Django could not confirm authorization.
+            # Fail closed instead of trusting old membership data.
+            return False
+
+        if not authorized:
+            # Reject explicit authorization denial.
+            ide_session_store.revoke_session(session_token)
+
+            return False
+
+        # Recheck the session after the asynchronous Django request.
+        # It might have been revoked while waiting for the response.
+        latest_session = ide_session_store.get_session(
+            session_token
+        )
+
+        if latest_session is None:
+            return False
+
+        if latest_session.sandbox_id != sandbox_id:
+            return False
+
+        if (
+            latest_session.developer_id != session.developer_id
+            or latest_session.group_id != session.group_id
+            or latest_session.membership_generation
+            != session.membership_generation
+        ):
+            return False
+
+        return True
+
+    # Validate membership before connecting to the IDE.
+    if not await check_membership():
+        await close_websocket_safely(websocket, code=1008)
+        return
+
+    # ---------------------------------------------------------
+    # STEP 4: Locate and validate the developer's Unix socket.
+    # ---------------------------------------------------------
+
     try:
         socket_path = get_ide_socket_path(sandbox_id)
 
@@ -90,22 +186,41 @@ async def proxy_ide_websocket(
         await close_websocket_safely(websocket, code=1011)
         return
 
-    # 4. Construct the upstream WebSocket resource path.
+    # ---------------------------------------------------------
+    # STEP 5: Construct the upstream WebSocket resource path.
+    # ---------------------------------------------------------
+
     upstream_path = f"/{path}" if path else "/"
 
     query_string = websocket.scope.get("query_string", b"")
 
     if query_string:
-        upstream_path += "?" + query_string.decode("ascii")
+        try:
+            upstream_path += "?" + query_string.decode("ascii")
+
+        except UnicodeDecodeError:
+            await close_websocket_safely(websocket, code=1008)
+            return
+
+    # ---------------------------------------------------------
+    # STEP 6: Connect to the developer's IDE.
+    # ---------------------------------------------------------
 
     try:
-        # 5. Connect to the developer's IDE through its Unix socket.
         async with unix_connect(
             path=str(socket_path),
             uri=f"ws://localhost{upstream_path}",
             open_timeout=10,
             max_size=16 * 1024 * 1024,
         ) as upstream:
+
+            # Membership might change while the socket is opening.
+            if not await check_membership():
+                await close_websocket_safely(
+                    websocket,
+                    code=1008,
+                )
+                return
 
             # Accept the authenticated browser connection.
             await websocket.accept()
@@ -115,15 +230,12 @@ async def proxy_ide_websocket(
 
                 while True:
                     try:
-                        # Wait for a browser message.
                         message = await websocket.receive()
 
                     except WebSocketDisconnect:
-                        # The browser disconnected normally.
                         return
 
                     except asyncio.CancelledError:
-                        # Preserve task cancellation.
                         raise
 
                     # Stop when the browser disconnects.
@@ -150,23 +262,23 @@ async def proxy_ide_websocket(
                         await websocket.send_text(message)
 
             async def monitor_session():
-                """Monitor the developer's authorization."""
+                """Recheck Django membership while the IDE is connected."""
 
                 while True:
+                    # Wait before checking again.
                     await asyncio.sleep(SESSION_CHECK_INTERVAL)
 
-                    current_session = ide_session_store.get_session(
-                        session_token
-                    )
+                    # Check both the local session and Django membership.
+                    authorized = await check_membership()
 
-                    # Stop if the session expires or is revoked.
-                    if (
-                        current_session is None
-                        or current_session.sandbox_id != sandbox_id
-                    ):
+                    # End the connection if authorization fails.
+                    if not authorized:
                         return
 
-            # 6. Start the forwarding and monitoring tasks.
+            # -------------------------------------------------
+            # STEP 7: Start forwarding and monitoring tasks.
+            # -------------------------------------------------
+
             tasks = [
                 asyncio.create_task(browser_to_ide()),
                 asyncio.create_task(ide_to_browser()),
@@ -174,7 +286,7 @@ async def proxy_ide_websocket(
             ]
 
             try:
-                # Wait until one task finishes.
+                # Wait until a forwarding or monitoring task finishes.
                 done, pending = await asyncio.wait(
                     tasks,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -184,7 +296,7 @@ async def proxy_ide_websocket(
                 ide_task = tasks[1]
                 monitor_task = tasks[2]
 
-                # Propagate unexpected errors from completed tasks.
+                # Propagate unexpected task errors.
                 for task in done:
                     if not task.cancelled():
                         error = task.exception()
@@ -192,7 +304,7 @@ async def proxy_ide_websocket(
                         if error is not None:
                             raise error
 
-                # Check authorization before choosing a close code.
+                # Check the current local session.
                 current_session = ide_session_store.get_session(
                     session_token
                 )
@@ -203,7 +315,8 @@ async def proxy_ide_websocket(
                 )
 
                 if session_invalid or monitor_task in done:
-                    # Session expired or was revoked.
+                    # Membership was denied, validation failed,
+                    # or the local session expired.
                     await close_websocket_safely(
                         websocket,
                         code=1008,
@@ -221,23 +334,23 @@ async def proxy_ide_websocket(
                     pass
 
             finally:
-                # Cancel unfinished background tasks.
+                # Cancel unfinished tasks.
                 for task in tasks:
                     if not task.done():
                         task.cancel()
 
-                # Wait for background tasks to finish.
+                # Wait for all tasks to finish.
                 await asyncio.gather(
                     *tasks,
                     return_exceptions=True,
                 )
 
     except WebSocketDisconnect:
-        # The browser disconnected.
+        # The browser disconnected normally.
         return
 
     except asyncio.CancelledError:
-        # Preserve cancellation during ASGI server shutdown.
+        # Preserve cancellation during server shutdown.
         raise
 
     except (OSError, ConnectionClosed, TimeoutError, ValueError):
@@ -254,13 +367,11 @@ async def proxy_ide_websocket(
 
     except Exception:
         # Log unexpected server-side errors.
-        # Internal exception details are not sent to the browser.
         logger.exception(
             "Unexpected IDE WebSocket error for sandbox %s",
             sandbox_id,
         )
 
-        # Notify the browser of an internal server error.
         await close_websocket_safely(
             websocket,
             code=1011,

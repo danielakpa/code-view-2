@@ -4,9 +4,9 @@
 <html lang="en">
 
 <head>
-    <!-- ========================================
+    <!-- =====================================================
          1. PAGE SETTINGS
-    ========================================= -->
+    ====================================================== -->
 
     <meta charset="UTF-8">
 
@@ -19,17 +19,19 @@
         Code Board | {{ group.name }} | CodeView
     </title>
 
-   <!-- Shared styles -->
-<link rel="stylesheet" href="{% static 'community/sheared.css' %}">
+    <!-- Shared CodeView styles. -->
+    <link
+        rel="stylesheet"
+        href="{% static 'community/sheared.css' %}"
+    >
 
-<!-- Code Board styles -->
-<link rel="stylesheet" href="{% static 'community/code_board/code_board.css' %}">
+    <!-- Existing Code Board styles. -->
+    <link
+        rel="stylesheet"
+        href="{% static 'community/code_board/code_board.css' %}"
+    >
 
-    <!-- ========================================
-         XTERM.JS TERMINAL STYLES
-    ======================================== -->
-
-    <!-- Load the terminal's CSS. -->
+    <!-- Xterm.js terminal styles. -->
     <link
         rel="stylesheet"
         href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
@@ -39,9 +41,9 @@
 
 <body>
 
-    <!-- ========================================
+    <!-- =====================================================
          2. TOP NAVIGATION
-    ========================================= -->
+    ====================================================== -->
 
     <header class="navbar">
 
@@ -78,13 +80,13 @@
 
     </header>
 
-    <!-- ========================================
-         3. CODE BOARD CONTENT
-    ========================================= -->
+    <!-- =====================================================
+         3. MAIN CODE BOARD
+    ====================================================== -->
 
     <main class="code-board-container">
 
-        <!-- Back to Meeting Room. -->
+        <!-- Return to the group's meeting room. -->
         <a
             href="{% url 'meeting_room' group.id %}"
             class="back-link"
@@ -92,9 +94,9 @@
             ← Back to Meeting Room
         </a>
 
-        <!-- ========================================
+        <!-- =================================================
              4. CODE BOARD HEADER
-        ========================================= -->
+        ================================================== -->
 
         <section class="code-board-header">
 
@@ -105,70 +107,61 @@
                 </h1>
 
                 <p>
-                    {{ group.name }} — Shared Code Workspace
+                    {{ group.name }} — Developer Workspace
+                </p>
+
+                <p>
+                    Write and run code directly from your browser.
                 </p>
 
             </div>
 
-            <!-- Last editor information. -->
+            <!-- Browser storage status. -->
             <div class="last-editor">
 
-                {% if board.last_edited_by %}
-
-                    Last edited by
-                    <strong>
-                        @{{ board.last_edited_by.username }}
-                    </strong>
-
-                {% else %}
-
-                    No edits yet
-
-                {% endif %}
+                <span id="workspace-status" role="status">
+                    Loading workspace...
+                </span>
 
             </div>
 
         </section>
-                      <!-- ========================================
-             GITHUB REPOSITORY INFORMATION
-        ========================================= -->
+
+        <!-- =================================================
+             5. GITHUB REPOSITORY INFORMATION
+        ================================================== -->
 
         <section class="code-board-repository">
 
             {% if repository %}
 
-                <!-- Display the connected GitHub repository. -->
                 <h2>
                     Connected GitHub Repository
                 </h2>
 
                 <p>
                     Repository:
+
                     <strong>
                         {{ repository.github_owner }}/{{ repository.repository_name }}
                     </strong>
                 </p>
 
-                <!-- Display the repository's default branch. -->
                 <p>
                     Default Branch:
+
                     <strong>
                         {{ repository.default_branch }}
                     </strong>
                 </p>
 
-                <!-- ====================================
-                     GITHUB BRANCH SELECTOR
-                ==================================== -->
-
+                <!-- GitHub branch selector. -->
                 <div class="branch-selector">
 
-                    <!-- Label for the branch dropdown. -->
                     <label for="github-branch">
                         Select Your Branch
                     </label>
 
-                    <!-- Display available GitHub branches. -->
                     <select
                         id="github-branch"
                         name="github_branch"
@@ -186,185 +179,357 @@
                         {% endfor %}
 
                     </select>
-                    <!-- ====================================
-     CREATE GITHUB BRANCH BUTTON
-==================================== -->
 
-<button
-    type="button"
-    class="create-branch-btn"
-    id="create-branch-btn"
-    disabled
-    title="GitHub authorization is required before creating branches"
->
-    + New Branch
-</button>
+                    <!-- Existing GitHub branch button. -->
+                    <button
+                        type="button"
+                        class="create-branch-btn"
+                        id="create-branch-btn"
+                        disabled
+                        title="GitHub authorization is required before creating branches"
+                    >
+                        + New Branch
+                    </button>
 
                 </div>
 
             {% else %}
 
-                <!-- Display this when no repository is connected. -->
                 <p>
-                    No GitHub repository has been connected to this group.
+                    No GitHub repository has been connected
+                    to this group.
                 </p>
 
             {% endif %}
 
         </section>
 
-        <!-- ========================================
-             5. CODE EDITOR FORM
-        ========================================= -->
+        <!-- =================================================
+             6. DEVELOPER WORKSPACE
+        ================================================== -->
 
-        <form method="POST" class="code-editor-form">
+        <!--
+            The group and developer IDs identify this browser
+            workspace.
 
-            <!-- Django security token for POST requests. -->
-            {% csrf_token %}
+            JavaScript uses them to keep files separate.
 
-            <!-- ====================================
-                 EDITOR TOOLBAR
-            ==================================== -->
+            These attributes do not grant permissions.
+            Django still checks permissions before execution.
+        -->
 
-            <div class="editor-toolbar">
+        <section
+            id="codeview-workspace"
+            class="codeview-workspace"
+            data-group-id="{{ group.id }}"
+            data-developer-id="{{ request.user.id }}"
+        >
 
-                <!-- Code title input. -->
-                <div class="toolbar-field">
+            <!-- =============================================
+                 7. FILE EXPLORER
+            ============================================== -->
 
-                    <label for="code-title">
-                        File Title
-                    </label>
+            <aside class="workspace-sidebar">
 
-                    <input
-                        type="text"
-                        id="code-title"
-                        name="title"
-                        value="{{ board.title }}"
-                        maxlength="200"
-                        placeholder="Enter code title"
-                        required
+                <div class="workspace-sidebar-header">
+
+                    <h2>
+                        Explorer
+                    </h2>
+
+                    <!-- Create a new browser-local file. -->
+                    <button
+                        type="button"
+                        id="new-file-btn"
+                        class="new-file-btn"
                     >
+                        + New File
+                    </button>
 
                 </div>
 
-                <!-- Programming language selection. -->
-                <div class="toolbar-field">
+                <p class="workspace-description">
+                    Your files are automatically saved
+                    in this browser.
+                </p>
 
-                    <label for="code-language">
-                        Language
-                    </label>
+                <!--
+                    workspace.js creates file buttons here.
 
-                    <select
-                        id="code-language"
-                        name="language"
-                    >
+                    Example:
 
-                        {% for value, label in board.LANGUAGE_CHOICES %}
+                    main.py
+                    utils.py
+                    app.js
+                -->
 
-                            <option
-                                value="{{ value }}"
-                                {% if board.language == value %}selected{% endif %}
-                            >
-                                {{ label }}
+                <div
+                    id="workspace-file-list"
+                    class="workspace-file-list"
+                    aria-label="Workspace files"
+                ></div>
+
+            </aside>
+
+            <!-- =============================================
+                 8. CODE EDITOR
+            ============================================== -->
+
+            <section class="workspace-editor">
+
+                <!-- Editor toolbar. -->
+                <div class="editor-toolbar">
+
+                    <div class="toolbar-field">
+
+                        <label for="code-language">
+                            Language
+                        </label>
+
+                        <!--
+                            The selected language determines
+                            which runtime executes the code.
+                        -->
+
+                        <select
+                            id="code-language"
+                            name="language"
+                        >
+
+                            <option value="python">
+                                Python
                             </option>
 
-                        {% endfor %}
+                            <option value="go">
+                                Go
+                            </option>
 
-                    </select>
+                            <option value="javascript">
+                                JavaScript
+                            </option>
 
-                </div>
+                        </select>
 
-            </div>
-
-            <!-- ====================================
-                 CODE EDITOR
-            ==================================== -->
-
-            <div class="editor-container">
-
-                <!-- Editor top bar. -->
-                <div class="editor-topbar">
-
-                    <span class="editor-filename">
-                        {{ board.title }}
-                    </span>
-
-                    <span class="editor-language">
-                        {{ board.get_language_display }}
-                    </span>
+                    </div>
 
                 </div>
 
-                <!-- Code writing area. -->
-                <textarea
-                    id="code-editor"
-                    name="code"
-                    class="code-editor"
-                    placeholder="Start writing your code here..."
-                    spellcheck="false"
-                >{{ board.code }}</textarea>
+                <!-- =========================================
+                     9. SOURCE CODE EDITOR
+                ========================================== -->
 
-            </div>
+                <div class="editor-container">
 
-            <!-- ====================================
-                 SAVE BUTTON
-            ==================================== -->
+                    <!-- File information. -->
+                    <div class="editor-topbar">
 
-            <div class="editor-actions">
+                        <span class="editor-filename">
+                            main.py
+                        </span>
 
-                <span class="save-info">
-                    Changes are saved when you click Save Code.
+                        <span class="editor-language">
+                            python
+                        </span>
+
+                    </div>
+
+                    <!--
+                        The developer writes code here.
+
+                        workspace.js automatically saves changes
+                        to IndexedDB.
+
+                        run_code.js reads the current editor value
+                        and sends it to Django when Run is clicked.
+
+                        No Save Code form is needed.
+                    -->
+
+                    <textarea
+                        id="code-editor"
+                        name="code"
+                        class="code-editor"
+                        placeholder="Start writing your code here..."
+                        spellcheck="false"
+                        aria-label="Source code editor"
+                    ></textarea>
+
+                </div>
+
+                <!-- =========================================
+                     10. RUN CODE BUTTON
+                ========================================== -->
+
+                <div class="editor-actions">
+
+                    <span class="save-info">
+                        Changes are saved automatically
+                        in this browser.
+                    </span>
+
+                    <!--
+                        JavaScript sends a POST request to Django.
+
+                        The URL is generated by Django rather than
+                        being hardcoded in JavaScript.
+                    -->
+
+                    <button
+                        type="button"
+                        id="run-code-btn"
+                        class="run-code-btn"
+                        data-run-url="{% url 'run_code_board' group.id %}"
+                    >
+                        ▶ Run Code
+                    </button>
+
+                </div>
+
+            </section>
+
+        </section>
+
+        <!-- =================================================
+             11. EXECUTION OUTPUT
+        ================================================== -->
+
+        <section class="code-board-output">
+
+            <div class="terminal-header">
+
+                <h2>
+                    Execution Output
+                </h2>
+
+                <!-- JavaScript updates this status. -->
+                <span
+                    id="execution-status"
+                    class="terminal-status"
+                    role="status"
+                >
+                    Ready
                 </span>
 
-                <button
-                    type="submit"
-                    class="save-code-btn"
-                >
-                    Save Code
-                </button>
-
             </div>
 
-        </form>
-                <!-- ========================================
-             6. PRIVATE DEVELOPER TERMINAL
-        ======================================== -->
+            <!--
+                Displays program output and errors.
+
+                textContent is used by JavaScript so that
+                program output is treated as text, not HTML.
+            -->
+
+            <pre
+                id="execution-output"
+                class="execution-output"
+                aria-live="polite"
+            >Click Run Code to execute your program.</pre>
+
+        </section>
+
+        <!-- =================================================
+             12. PRIVATE DEVELOPER TERMINAL
+        ================================================== -->
 
         <section class="code-board-terminal">
 
-            <!-- Terminal heading. -->
             <div class="terminal-header">
 
                 <h2>
                     Terminal
                 </h2>
 
-                <span class="terminal-status" id="terminal-status">
+                <span
+                    class="terminal-status"
+                    id="terminal-status"
+                >
                     Not connected
                 </span>
 
             </div>
 
-<!-- Display the developer's private terminal. -->
-<div
-    id="terminal-container"
-    class="terminal-container"
-    data-group-id="{{ group.id }}"
-    aria-label="Private developer terminal"
-></div>
+            <!--
+                Preserve the existing private terminal.
+
+                terminal.js uses this element to initialize
+                the xterm.js terminal.
+            -->
+
+            <div
+                id="terminal-container"
+                class="terminal-container"
+                data-group-id="{{ group.id }}"
+                aria-label="Private developer terminal"
+            ></div>
 
         </section>
 
     </main>
-        <!-- ========================================
-         XTERM.JS TERMINAL LIBRARY
-    ======================================== -->
 
-    <!-- Load the terminal library. -->
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+    <!-- =====================================================
+         13. DJANGO CSRF TOKEN
+    ====================================================== -->
 
-    <!-- Load our CodeView terminal JavaScript. -->
-    <script src="{% static 'community/code_board/terminal.js' %}"></script>
+    <!--
+        Django requires a CSRF token for POST requests.
+
+        The form is not submitted to save code.
+
+        run_code.js reads the hidden token and sends it
+        with the execution request.
+    -->
+
+    <form id="codeview-csrf-form" hidden>
+        {% csrf_token %}
+    </form>
+
+    <!-- =====================================================
+         14. JAVASCRIPT LIBRARIES
+    ====================================================== -->
+
+    <!-- Existing xterm.js terminal library. -->
+    <script
+        src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"
+    ></script>
+
+    <!-- =====================================================
+         15. CODEVIEW JAVASCRIPT
+    ====================================================== -->
+
+    <!--
+        Load IndexedDB first.
+
+        It provides the functions used by workspace.js.
+    -->
+
+    <script
+        src="{% static 'community/code_board/indexeddb.js' %}"
+    ></script>
+
+    <!--
+        Manage files and automatically save source code
+        in the developer's browser.
+    -->
+
+    <script
+        src="{% static 'community/code_board/workspace.js' %}"
+    ></script>
+
+    <!--
+        Execute code through Django and FastAPI.
+    -->
+
+    <script
+        src="{% static 'community/code_board/run_code.js' %}"
+    ></script>
+
+    <!--
+        Preserve the existing private terminal.
+    -->
+
+    <script
+        src="{% static 'community/code_board/terminal.js' %}"
+    ></script>
 
 </body>
 

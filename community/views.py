@@ -5,8 +5,25 @@
 # 1. PYTHON BUILT-IN MODULES
 # ============================================================
 
+# Convert a sandbox ID string into a validated UUID.
+from uuid import UUID
+
+# Verify developer membership and obtain its current generation.
+from server_runner.ide_gateway import authorize_ide_request
+
+# Communicate with the secure IDE Gateway.
+from server_runner.ide_gateway_client import (
+    IDEGatewayClient,
+    IDEGatewayUnavailableError,
+)
+
+# Create a short-lived signed IDE authorization grant.
+from server_runner.ide_gateway_service.grants import create_ide_grant
+
 # Import HttpResponse to return an HTTP response to the browser.
 from django.http import HttpResponse
+
+from django.conf import settings
 
 # Reuse CodeView's Code Board execution authorization.
 from server_runner.services import authorize_code_board_execution
@@ -1222,87 +1239,81 @@ def meeting_room(request, group_id):
 # 9. PRIVATE GROUP CODE BOARD
 # ============================================================
 
+# ============================================================
+# 9. PRIVATE GROUP CODE BOARD
+# ============================================================
+
 @login_required
 def code_board(request, group_id):
     """
     Display the developer's private Code Board.
 
-    Source code is written and executed directly from the browser.
-    We do not save temporary source code to PostgreSQL.
+    Each developer gets an isolated Docker workspace.
+    Django verifies group membership before authorizing IDE access.
     """
-        # ========================================================
-    # STEP 1: ALLOW ONLY GET REQUESTS
+
+    # ========================================================
+    # STEP 1: VALIDATE THE REQUEST
     # ========================================================
 
-    # Reject unsupported HTTP methods before starting Docker.
+    # Only GET requests can open the Code Board.
     if request.method != "GET":
         return HttpResponseNotAllowed(["GET"])
 
-    # ========================================================
-    # STEP 1: FIND THE DEVELOPMENT GROUP
-    # ========================================================
-
+    # Find the development group.
     group = get_object_or_404(
         ProjectGroup,
         id=group_id,
     )
 
-    # Code Boards are available only in private groups.
+    # Code Boards are available only to private groups.
     if not group.is_private:
         return HttpResponseForbidden(
-            "Code boards are only available to private development groups."
+            "Code Boards are only available to private development groups."
         )
 
-    # Developers must belong to the group.
+    # Verify that the developer belongs to this group.
     if not is_group_member(group, request.user):
         return HttpResponseForbidden(
-            "You must belong to this group to access its code board."
+            "You must belong to this group to access its Code Board."
         )
 
     # ========================================================
     # STEP 2: GET THE DEVELOPER'S PRIVATE CODE BOARD
     # ========================================================
 
-    # Keep a board record for ownership and authorization.
-    # The board is no longer used to save temporary source code.
+    # Each developer owns their own Code Board record.
+    # Temporary source code is not stored in PostgreSQL.
     board, created = GroupCodeBoard.objects.get_or_create(
         group=group,
         owner=request.user,
     )
-        # ========================================================
-    # STEP 3: PREPARE THE DEVELOPER'S EXECUTION SANDBOX
-    # ========================================================
 
-    # Ask the FastAPI Runner to prepare a private sandbox.
-    # The developer's group membership has already been verified.
-       # ========================================================
-    # STEP 3: PREPARE AND START THE DEVELOPER'S DOCKER IDE
+    # ========================================================
+    # STEP 3: PREPARE AND START THE DOCKER IDE
     # ========================================================
 
     try:
-        # Create one Runner client for both operations.
+        # Create the FastAPI Runner client.
         runner_client = CodeExecutionRunnerClient()
 
-        # First, prepare the developer's persistent workspace.
-        sandbox = async_to_sync(
+        # Prepare the developer's private workspace.
+        async_to_sync(
             runner_client.prepare_sandbox
         )(
             developer_id=request.user.pk,
             group_id=group.pk,
         )
 
-        # Next, ask the Runner to create or start the Docker IDE.
+        # Start or reuse the developer's Docker IDE.
         ide = async_to_sync(
             runner_client.ensure_ide
         )(
             developer_id=request.user.pk,
             group_id=group.pk,
         )
-        # ========================================
-        # VERIFY THAT THE DOCKER IDE IS READY
-        # ========================================
 
-        # The IDE must be running and fully ready.
+        # Confirm that the IDE is running and ready.
         if (
             ide.get("status") != "running"
             or ide.get("ready") is not True
@@ -1315,26 +1326,123 @@ def code_board(request, group_id):
 
     except RunnerUnavailableError:
 
-        # Do not expose internal service errors or tokens.
+        # Do not expose internal Runner errors.
         return HttpResponse(
             "CodeView could not start your development environment. "
             "Please try again.",
             status=503,
         )
-        
+
     # ========================================================
-    # STEP 4: FIND THE CONNECTED GITHUB REPOSITORY
+    # STEP 4: AUTHORIZE THE DEVELOPER'S PRIVATE VS CODE IDE
+    # ========================================================
+
+    try:
+        # Recheck membership after Docker startup.
+        #
+        # The membership generation helps invalidate access
+        # when a developer is removed or their membership changes.
+        (
+            developer_id,
+            authorized_group_id,
+            membership_generation,
+        ) = async_to_sync(
+            authorize_ide_request
+        )(
+            user=request.user,
+            group_id=group.pk,
+        )
+
+        # Validate the sandbox UUID returned by the Runner.
+        #
+        # The browser cannot choose its own sandbox identity.
+        sandbox_id = UUID(
+            str(ide["sandbox_id"])
+        )
+
+        # Reject an empty UUID.
+        if sandbox_id.int == 0:
+            raise ValueError("Invalid sandbox identity.")
+
+        # Create a signed, short-lived authorization grant.
+        grant = create_ide_grant(
+            developer_id=developer_id,
+            group_id=authorized_group_id,
+            sandbox_id=sandbox_id,
+            membership_generation=membership_generation,
+        )
+
+        # Create the IDE Gateway client.
+        gateway_client = IDEGatewayClient()
+
+        # Send the signed grant to the IDE Gateway.
+        #
+        # The Gateway verifies the grant through the Runner
+        # and creates a one-time browser handoff ticket.
+        authorization = async_to_sync(
+            gateway_client.authorize_ide
+        )(grant)
+
+        # Confirm that authorization succeeded.
+        if authorization.get("authorized") is not True:
+            return HttpResponse(
+                "CodeView could not authorize your IDE.",
+                status=503,
+            )
+
+        # Confirm that the Gateway authorized the correct sandbox.
+        authorized_sandbox_id = UUID(
+            str(authorization["sandbox_id"])
+        )
+
+        if authorized_sandbox_id != sandbox_id:
+            return HttpResponse(
+                "CodeView IDE authorization identity mismatch.",
+                status=503,
+            )
+
+        # Retrieve the one-time browser handoff ticket.
+        handoff_ticket = authorization["handoff_ticket"]
+
+        # Confirm the ticket is a nonempty string.
+        if not isinstance(handoff_ticket, str) or not handoff_ticket:
+            raise ValueError("Invalid IDE handoff ticket.")
+
+    except PermissionError:
+
+        # Deny access if group membership has been revoked.
+        return HttpResponseForbidden(
+            "You no longer have permission to access this Code Board."
+        )
+
+    except (
+        IDEGatewayUnavailableError,
+        ValueError,
+        KeyError,
+        TypeError,
+        RuntimeError,
+    ):
+
+        # Fail closed without exposing internal credentials.
+        return HttpResponse(
+            "CodeView could not authorize your development environment. "
+            "Please try again.",
+            status=503,
+        )
+
+    # ========================================================
+    # STEP 5: FIND THE CONNECTED GITHUB REPOSITORY
     # ========================================================
 
     repository = GroupRepository.objects.filter(
         group=group,
     ).first()
 
-    # Store available GitHub branches.
+    # Store the available GitHub branches.
     branches = []
 
     # ========================================================
-    # STEP 5: RETRIEVE GITHUB BRANCHES
+    # STEP 6: RETRIEVE GITHUB BRANCHES
     # ========================================================
 
     if repository:
@@ -1356,9 +1464,11 @@ def code_board(request, group_id):
         )
 
         try:
-
-            # Request branches from GitHub.
-            with urlopen(github_request, timeout=10) as response:
+            # Request the repository's branches from GitHub.
+            with urlopen(
+                github_request,
+                timeout=10,
+            ) as response:
                 branches_data = json.load(response)
 
             # Extract branch names.
@@ -1375,21 +1485,36 @@ def code_board(request, group_id):
             KeyError,
         ):
 
-            # Keep CodeView working if GitHub is unavailable.
+            # Keep the Code Board available if GitHub fails.
             branches = []
 
     # ========================================================
-    # STEP 6: FALLBACK TO THE DEFAULT BRANCH
+    # STEP 7: FALLBACK TO THE DEFAULT BRANCH
     # ========================================================
 
     if repository and not branches:
-        branches = [repository.default_branch]
+        branches = [
+            repository.default_branch
+        ]
 
     # ========================================================
-    # STEP 7: DISPLAY THE CODE BOARD
+    # STEP 8: BUILD THE IDE HANDOFF URL
     # ========================================================
 
-    return render(
+    # Build the browser-facing Gateway handoff URL.
+    #
+    # The ticket is short-lived and can be used only once.
+    ide_handoff_url = (
+        f"{settings.CODEVIEW_IDE_GATEWAY_URL.rstrip('/')}"
+        f"/ide/handoff/{handoff_ticket}"
+    )
+
+    # ========================================================
+    # STEP 9: DISPLAY THE CODE BOARD
+    # ========================================================
+
+    # Render the existing Code Board template.
+    response = render(
         request,
         "community/code_board.html",
         {
@@ -1397,9 +1522,19 @@ def code_board(request, group_id):
             "board": board,
             "repository": repository,
             "branches": branches,
+            "ide_handoff_url": ide_handoff_url,
         },
     )
 
+    # Prevent caching of the page containing the handoff URL.
+    response["Cache-Control"] = "no-store"
+
+    # Prevent leaking the handoff URL through Referer headers.
+    response["Referrer-Policy"] = "no-referrer"
+
+    return response
+
+    
 @login_required
 @require_POST
 def run_code_board(request, group_id):
