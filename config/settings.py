@@ -215,3 +215,21 @@ CODEVIEW_IDE_GATEWAY_TOKEN = os.environ.get(
     "CODEVIEW_IDE_GATEWAY_TOKEN",
     "",
 )
+
+# ============================================================
+# IDE MEMBERSHIP VALIDATION TOKEN
+# ============================================================
+
+# Secret shared between Django and the IDE Gateway.
+#
+# The Gateway sends this token when asking Django to verify
+# whether a developer still belongs to a private group.
+#
+# Django compares the supplied token with this configured value.
+#
+# SECURITY:
+# Never expose this token to browsers or hardcode its value.
+CODEVIEW_IDE_MEMBERSHIP_TOKEN = os.environ.get(
+    "CODEVIEW_IDE_MEMBERSHIP_TOKEN",
+    "",
+)

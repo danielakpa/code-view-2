@@ -82,13 +82,26 @@ CODEVIEW_CONTROLLER_URL=http://127.0.0.1:8002
 CODEVIEW_RUNNER_DATABASE_URL=postgresql+psycopg://codeview_runner:Danielakpa.10@127.0.0.1:5432/codeview_db
 
 sudo docker pull ghcr.io/danielakpa/codeview-developer:dev
-python3 -m pip install fastapi httpx uvicorn               
-python3 -m pip install sqlalchemy 
+
+
+
+
 
 CODEVIEW_CONTROLLER_URL=http://127.0.0.1:9100
 CODEVIEW_CONTROLLER_TOKEN=UE_kd5niJWhUqfTWhOpHnrkBCweB1fHgufw6CdKFG7NgD3lOdjnpksPnr3GasNTL
+
+
 
 psql -h localhost -U codeview_controller -d codeview_test_db -W
 nano ~/.pgpass
 localhost:5432:codeview_test_db:codeview_controller:Danielakpa.10
 chmod 600 ~/.pgpass
+
+
+
+# Directory containing IDE Unix sockets.
+CODEVIEW_IDE_SOCKET_ROOT=/run/codeview/ide-sockets
+CODEVIEW_IDE_GATEWAY_TOKEN=k-Qr3N0g9pxHOcip1pjfOisd9HGi3DLm8t6g_LrIQjer9P0k88JNu0PeVvzjxqce
+CODEVIEW_IDE_GRANT_SECRET=vJh_Cz_ZWhmurVYNTvGYNgOwBjVwyaz_5dCkv94xQZxZtGh2Qc5JKS3UZNXV5ykA
+CODEVIEW_IDE_MEMBERSHIP_TOKEN=dW_aF48ee3eRqqeJS7g8J31MHt62TMk6LVeLzlLuGw2EU2kRXWr-Gr_GfecxGPWH
+CODEVIEW_DJANGO_INTERNAL_URL=http://127.0.0.1:8000
